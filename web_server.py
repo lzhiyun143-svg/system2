@@ -4,6 +4,11 @@ from typing import Any, Dict, List, Optional
 import os
 import time
 import inspect
+import re
+import json
+import base64
+from datetime import datetime
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,12 +29,17 @@ DASHSCOPE_BASE_URL = os.getenv(
 )
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")  # 必须在环境变量里设置
 DASHSCOPE_MODEL = os.getenv("DASHSCOPE_MODEL", "qwen-plus")  # 可换 qwen-max
+DASHSCOPE_VL_MODEL = os.getenv("DASHSCOPE_VL_MODEL", "qwen-vl-plus")
 STANDARD_DIR = os.getenv("STANDARD_DIR", "./standards")
+
 
 # 安全：限制喂给 LLM 的最大 comment 数量/长度，避免 payload 过大
 MAX_RULE_COMMENTS = int(os.getenv("MAX_RULE_COMMENTS", "6"))
 MAX_COMMENT_CHARS = int(os.getenv("MAX_COMMENT_CHARS", "120"))
 
+# 图片保存路径
+COMPARE_FRAMES_DIR = Path("D:\system\system2_compare_frames")
+COMPARE_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
 # =========================
 # FastAPI
@@ -235,6 +245,184 @@ def llm_confirm_judge(action: str, eval_result: Dict[str, Any]) -> Dict[str, Any
             "latency_sec": round(latency, 3),
             "raw": text,
         }
+    
+
+# 视觉调用
+def llm_confirm_judge_by_images(
+    action: str,
+    standard_images: List[str],
+    user_images: List[str],
+    eval_result: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    client = get_llm_client()  # 你原来已有的方法，保留
+
+    # 后端兜底限制，防止 payload 太大
+    standard_images = (standard_images or [])[:6]
+    user_images = (user_images or [])[:6]
+
+    if len(standard_images) < 2 or len(user_images) < 2:
+        return {
+            "is_pass": None,
+            "confidence": 0.0,
+            "overall": "关键帧数量不足，建议至少提供每侧2-4张关键帧。",
+            "key_issues": ["关键帧不足或未成功采集"],
+            "tips": ["重新采集动作", "确保人物完整入镜", "网络稳定后重试"],
+            "mode": "vision_keyframes",
+            "model": DASHSCOPE_VL_MODEL,
+        }
+
+    helper_text = ""
+    if eval_result:
+        # 可选：把规则评估结果做辅助提示（截断避免太长）
+        helper_text = f"\n规则评估辅助信息（可选参考）: {json.dumps(eval_result, ensure_ascii=False)[:700]}"
+
+    prompt_text = f"""
+你是康复训练动作评估复核官。
+任务：对比“标准动作关键帧”和“用户动作关键帧”，判断用户动作是否基本达标，并给出简洁、可执行建议。
+
+动作名称：{action}
+
+输入说明：
+- 先给你【标准动作关键帧】（按时间顺序）
+- 再给你【用户动作关键帧】（按时间顺序）
+- 重点比较：动作幅度、抬起高度、左右对称性、时序一致性、是否有明显代偿
+{helper_text}
+
+输出要求（严格 JSON，仅 JSON，不要任何多余文字）：
+{{
+  "is_pass": true,
+  "confidence": 0.0,
+  "overall": "一句话总结",
+  "key_issues": ["问题1", "问题2"],
+  "tips": ["建议1", "建议2", "建议3"]
+}}
+
+要求：
+- 中文输出
+- confidence 在 0~1
+- 如果图像不清楚或看不全，请保守判断并在 overall / key_issues 里说明
+- 不要提模型、分辨率、像素等技术词
+""".strip()
+
+    content_items = [{"type": "text", "text": prompt_text}]
+
+    # 标准帧
+    content_items.append({"type": "text", "text": "下面是【标准动作关键帧】（按时间顺序）"})
+    for i, img in enumerate(standard_images, 1):
+        content_items.append({"type": "text", "text": f"标准帧{i}"})
+        content_items.append({"type": "image_url", "image_url": {"url": img}})
+
+    # 用户帧
+    content_items.append({"type": "text", "text": "下面是【用户动作关键帧】（按时间顺序）"})
+    for i, img in enumerate(user_images, 1):
+        content_items.append({"type": "text", "text": f"用户帧{i}"})
+        content_items.append({"type": "image_url", "image_url": {"url": img}})
+
+    t0 = time.time()
+    resp = client.chat.completions.create(
+        model=DASHSCOPE_VL_MODEL,  # 注意这里用视觉模型
+        messages=[
+            {"role": "system", "content": "Return valid JSON only."},
+            {"role": "user", "content": content_items},
+        ],
+        temperature=0.1,
+        max_tokens=512,
+    )
+    latency = time.time() - t0
+
+    text = (resp.choices[0].message.content or "").strip()
+
+    try:
+        if text.startswith("```"):
+            text = text.strip("`")
+            text = text.replace("json", "", 1).strip()
+
+        data = json.loads(text)
+        data["mode"] = "vision_keyframes"
+        data["model"] = DASHSCOPE_VL_MODEL
+        data["latency_sec"] = round(latency, 3)
+        return data
+    except Exception:
+        return {
+            "is_pass": None,
+            "confidence": 0.0,
+            "overall": "LLM 返回格式异常（非JSON），请查看 raw。",
+            "key_issues": ["返回格式解析失败"],
+            "tips": ["稍后重试", "检查视觉模型配置"],
+            "mode": "vision_keyframes",
+            "model": DASHSCOPE_VL_MODEL,
+            "latency_sec": round(latency, 3),
+            "raw": text,
+        }
+
+
+
+def _save_dataurl_image(data_url: str, out_path: Path) -> bool:
+    """
+    支持 data:image/jpeg;base64,... / data:image/png;base64,...
+    """
+    try:
+        if not data_url or "," not in data_url:
+            return False
+
+        header, b64data = data_url.split(",", 1)
+        if "base64" not in header:
+            return False
+
+        raw = base64.b64decode(b64data)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(raw)
+        return True
+    except Exception as e:
+        print(f"[save_dataurl_image] failed: {e}")
+        return False
+    
+def save_compare_keyframes(
+    action: str,
+    standard_images: List[str],
+    user_images: List[str],
+) -> Dict[str, Any]:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_action = re.sub(r"[^a-zA-Z0-9_\-]", "_", action or "unknown")
+    session_dir = COMPARE_FRAMES_DIR / f"{ts}_{safe_action}"
+
+    std_dir = session_dir / "standard"
+    usr_dir = session_dir / "user"
+    std_dir.mkdir(parents=True, exist_ok=True)
+    usr_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_std = []
+    saved_usr = []
+
+    for i, data_url in enumerate(standard_images or [], 1):
+        ext = ".jpg"
+        if data_url.startswith("data:image/png"):
+            ext = ".png"
+        out_path = std_dir / f"std_{i:02d}{ext}"
+        if _save_dataurl_image(data_url, out_path):
+            saved_std.append(str(out_path))
+
+    for i, data_url in enumerate(user_images or [], 1):
+        ext = ".jpg"
+        if data_url.startswith("data:image/png"):
+            ext = ".png"
+        out_path = usr_dir / f"user_{i:02d}{ext}"
+        if _save_dataurl_image(data_url, out_path):
+            saved_usr.append(str(out_path))
+
+    return {
+        "session_dir": str(session_dir),
+        "saved_standard_count": len(saved_std),
+        "saved_user_count": len(saved_usr),
+        "saved_standard_files": saved_std,
+        "saved_user_files": saved_usr,
+    }
+
+def save_json_file(path: Path, data: Dict[str, Any]):
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[save_json_file] failed: {e}")
 
 
 # =========================
@@ -264,6 +452,9 @@ class ConfirmRequest(BaseModel):
     standard_seq: Optional[List[FrameIn]] = None
     # 前端把 /api/evaluate 的结果带上（推荐）
     eval_result: Dict[str, Any]
+
+    standard_images: Optional[List[str]] = None
+    user_images: Optional[List[str]] = None
 
 
 @app.get("/health")
@@ -301,15 +492,60 @@ def api_confirm_get() -> Dict[str, Any]:
 @app.post("/api/confirm")
 def api_confirm_post(req: ConfirmRequest) -> Dict[str, Any]:
     try:
-        # 你也可以在这里做更多 check，比如 frames 是否 >= 3
-        if len(req.frames) < 3:
+        # 旧字段校验（兼容你的现有逻辑）
+        if req.frames is not None and len(req.frames) < 3:
             raise HTTPException(status_code=400, detail="Too few valid frames (<3).")
 
-        out = {
+        # =========================
+        # 新模式：关键帧图像复核（优先）
+        # =========================
+        if req.standard_images and req.user_images:
+            # 后端兜底限制，避免 payload 太大
+            std_imgs = (req.standard_images or [])[:6]
+            usr_imgs = (req.user_images or [])[:6]
+
+            # 1) 保存关键帧到专门文件夹
+            save_info = save_compare_keyframes(
+                action=req.action,
+                standard_images=std_imgs,
+                user_images=usr_imgs,
+            )
+
+            # 2) 视觉模型复核（看图对比）
+            llm_out = llm_confirm_judge_by_images(
+                action=req.action,
+                standard_images=std_imgs,
+                user_images=usr_imgs,
+                eval_result=req.eval_result,  # 可选辅助
+            )
+
+            # 3) 保存结果（可选）
+            try:
+                save_json_file(Path(save_info["session_dir"]) / "llm_result.json", llm_out)
+            except Exception:
+                pass
+
+            return {
+                "action": req.action,
+                "confirm_mode": "vision_keyframes",
+                "llm_confirm": llm_out,
+                "saved_frames": {
+                    "session_dir": save_info["session_dir"],
+                    "saved_standard_count": save_info["saved_standard_count"],
+                    "saved_user_count": save_info["saved_user_count"],
+                },
+            }
+
+        # =========================
+        # 旧模式：JSON 复核（兼容）
+        # =========================
+        llm_out = llm_confirm_judge(req.action, req.eval_result or {})
+
+        return {
             "action": req.action,
-            "llm_confirm": llm_confirm_judge(req.action, req.eval_result),
+            "confirm_mode": "json_eval",
+            "llm_confirm": llm_out,
         }
-        return out
 
     except HTTPException:
         raise
@@ -318,8 +554,8 @@ def api_confirm_post(req: ConfirmRequest) -> Dict[str, Any]:
             status_code=500,
             detail=f"LLM confirm POST failed: {type(e).__name__}: {e}",
         )
-
-
+    
+    
 # =========================
 # Main evaluate endpoint
 # =========================

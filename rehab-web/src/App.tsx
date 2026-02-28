@@ -39,6 +39,7 @@ const EVAL_API = "/api/evaluate";
 const LLM_PING_API = "/api/llm_ping";
 const LLM_CONFIRM_API = "/api/confirm";
 
+
 // 标准视频（public/demos/raise_arm.mp4）
 const DEMO_VIDEO_BY_ACTION: Record<ActionName, string> = {
   raise_arm: "/demos/raise_arm.mp4",
@@ -109,6 +110,8 @@ export default function App() {
 
   // frames buffer
   const framesRef = useRef<FramePayload[]>([]);
+  const userKeyframesRef = useRef<string[]>([]);
+  const stdKeyframesRef = useRef<string[]>([]);
 
   // 采集窗口：3 秒
   const captureStartTsRef = useRef<number | null>(null);
@@ -206,63 +209,124 @@ export default function App() {
       cancelled = true;
     };
   }, []);
+  
+  //截图工具
+  function captureVideoFrameToDataURL(
+  video: HTMLVideoElement,
+  maxW = 480,
+  quality = 0.7
+): string | null {
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  if (!w || !h) return null;
 
+  const scale = Math.min(1, maxW / w);
+  const cw = Math.max(1, Math.round(w * scale));
+  const ch = Math.max(1, Math.round(h * scale));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = cw;
+  canvas.height = ch;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+
+  ctx.drawImage(video, 0, 0, cw, ch);
+  return canvas.toDataURL("image/jpeg", quality);
+}
+
+  //关键帧采样时间点工具
+  function getKeyframeTargets(totalMs: number) {
+    return [0, 0.25, 0.5, 0.75, 0.95].map((r) => r * totalMs);
+  }
   // ====== 1.5) 构建标准骨架序列（从标准视频抽帧，取3秒窗口） ======
   async function buildStandardSequence() {
-    standardReadyRef.current = false;
-    standardSeqRef.current = [];
+  standardReadyRef.current = false;
+  standardSeqRef.current = [];
+  stdKeyframesRef.current = []; // 新增：重建标准序列时清空标准关键帧
 
-    const video = standardVideoRef.current;
-    const poseLm = poseLmStdRef.current;
-    if (!video || !poseLm) return;
+  const video = standardVideoRef.current;
+  const poseLm = poseLmStdRef.current;
+  if (!video || !poseLm) return;
 
-    // 确保加载完成
-    if (video.readyState < 2) {
-      await new Promise<void>((resolve) => {
-        const onLoaded = () => {
-          video.removeEventListener("loadeddata", onLoaded);
-          resolve();
-        };
-        video.addEventListener("loadeddata", onLoaded);
-        video.load();
-      });
-    }
-
-    const videoDurationMs = (video.duration || 3) * 1000;
-    const durMs = Math.min(TARGET_DURATION_MS, videoDurationMs);
-
-    const seq: FramePayload[] = [];
-    const baseTs = performance.now();
-
-    // 通过 seek 抽帧
-    for (let t = 0; t < durMs; t += SAMPLE_INTERVAL_MS) {
-      const ct = Math.min(video.duration || 3, t / 1000);
-      video.currentTime = ct;
-
-      await new Promise<void>((resolve) => {
-        const onSeeked = () => {
-          video.removeEventListener("seeked", onSeeked);
-          resolve();
-        };
-        video.addEventListener("seeked", onSeeked);
-      });
-
-      const ts = baseTs + t;
-      const poseRes = poseLm.detectForVideo(video, ts);
-      const posePts = poseRes.landmarks?.[0];
-      if (!posePts) continue;
-
-      const pose33x3 = posePts.map((p: any) => [clamp01(p.x), clamp01(p.y), 0.0]);
-      seq.push({
-        pose: pose33x3,
-        left_hand: [],
-        right_hand: [],
-      });
-    }
-
-    standardSeqRef.current = seq;
-    standardReadyRef.current = seq.length >= 3;
+  // 确保加载完成
+  if (video.readyState < 2) {
+    await new Promise<void>((resolve) => {
+      const onLoaded = () => {
+        video.removeEventListener("loadeddata", onLoaded);
+        resolve();
+      };
+      video.addEventListener("loadeddata", onLoaded, { once: true });
+      video.load();
+    });
   }
+
+  // 再兜底等一下 metadata（确保 videoWidth/videoHeight/duration 可用）
+  if (!video.videoWidth || !video.videoHeight || !video.duration) {
+    await new Promise<void>((resolve) => {
+      const onMeta = () => {
+        video.removeEventListener("loadedmetadata", onMeta);
+        resolve();
+      };
+      video.addEventListener("loadedmetadata", onMeta, { once: true });
+    }).catch(() => {});
+  }
+
+  const videoDurationMs = (video.duration || 3) * 1000;
+  const durMs = Math.min(TARGET_DURATION_MS, videoDurationMs);
+
+  const seq: FramePayload[] = [];
+  const baseTs = performance.now();
+
+  // 新增：关键帧目标时刻（标准视频也按固定比例取 5 张）
+  const keyTargets = getKeyframeTargets(durMs);
+  let nextKeyIdx = 0;
+
+  // 通过 seek 抽帧
+  for (let t = 0; t < durMs; t += SAMPLE_INTERVAL_MS) {
+    const ct = Math.min(video.duration || 3, t / 1000);
+    video.currentTime = ct;
+
+    await new Promise<void>((resolve) => {
+      const onSeeked = () => {
+        video.removeEventListener("seeked", onSeeked);
+        resolve();
+      };
+      video.addEventListener("seeked", onSeeked, { once: true });
+    });
+
+    // 新增：先尝试截标准关键帧（不依赖是否检测到骨架，避免漏图）
+    if (nextKeyIdx < keyTargets.length && t >= keyTargets[nextKeyIdx]) {
+      const img = captureVideoFrameToDataURL(video, 480, 0.7);
+      if (img) stdKeyframesRef.current.push(img);
+      nextKeyIdx += 1;
+    }
+
+    const ts = baseTs + t;
+    const poseRes = poseLm.detectForVideo(video, ts);
+    const posePts = poseRes.landmarks?.[0];
+    if (!posePts) continue;
+
+    const pose33x3 = posePts.map((p: any) => [clamp01(p.x), clamp01(p.y), 0.0]);
+    seq.push({
+      pose: pose33x3,
+      left_hand: [],
+      right_hand: [],
+    });
+  }
+
+  // 兜底：如果因为步长/时序原因关键帧不足，补到 5 张（尽量补当前帧）
+  while (stdKeyframesRef.current.length < keyTargets.length) {
+    const img = captureVideoFrameToDataURL(video, 480, 0.7);
+    if (!img) break;
+    stdKeyframesRef.current.push(img);
+  }
+
+  standardSeqRef.current = seq;
+  standardReadyRef.current = seq.length >= 3;
+
+  // 可选调试日志（建议先留着，确认采样正常后再删）
+  console.log("[buildStandardSequence] seq:", seq.length, "stdKeyframes:", stdKeyframesRef.current.length);
+}
 
   // MediaPipe ready + action变化后，自动重建标准序列
   useEffect(() => {
@@ -432,12 +496,13 @@ export default function App() {
 
       ctx.restore();
 
-      // ====== 采样入 buffer：采满 3 秒全帧 ======
+     // ====== 采样入 buffer：采满 3 秒全帧 ======
       if (!posePts) return;
 
       // 第一次开始采样
       if (captureStartTsRef.current == null) {
         captureStartTsRef.current = ts;
+        userKeyframesRef.current = []; // 新增：开始新一轮采样时清空用户关键帧
       }
 
       const elapsed = ts - captureStartTsRef.current;
@@ -448,9 +513,27 @@ export default function App() {
         return;
       }
 
-      // 采样间隔控制
+     // 采样间隔控制
       if (ts - lastSampleTsRef.current < SAMPLE_INTERVAL_MS) return;
       lastSampleTsRef.current = ts;
+
+      // ====== 新增：按固定时刻抓用户关键帧（5张） ======
+      const keyTargets = getKeyframeTargets(TARGET_DURATION_MS);
+      // 当前应抓第几张，就看 userKeyframesRef.current.length
+      if (userKeyframesRef.current.length < keyTargets.length) {
+        const nextTarget = keyTargets[userKeyframesRef.current.length];
+
+        // 到达下一个目标时刻就截图
+        // videoEl 用你当前循环里实际在读的用户视频元素变量名
+        if (elapsed >= nextTarget) {
+          const img = captureVideoFrameToDataURL(video, 480, 0.7);
+          if (img) {
+            userKeyframesRef.current.push(img);
+            // 可选调试
+            // console.log("[user keyframe]", userKeyframesRef.current.length, "elapsed=", Math.round(elapsed));
+          }
+        }
+      }
 
       const pose33x3 = posePts.map((p: any) => [clamp01(p.x), clamp01(p.y), 0.0]);
       const left21x3 = leftHand
@@ -568,69 +651,99 @@ export default function App() {
 
   // ====== 6) Confirm (LLM)：可选（需要你后端实现 POST /api/confirm） ======
   async function confirmLLM() {
-    setConfirmError("");
-    setConfirmResult(null);
+  setConfirmError("");
+  setConfirmResult(null);
 
-    if (!captureDoneRef.current) {
-      setConfirmError(`还没采集满 ${TARGET_DURATION_MS / 1000}s，请继续保持动作...`);
-      return;
-    }
-
-    const frames = framesRef.current;
-    if (frames.length < 3) {
-      setConfirmError(`有效帧过少：${frames.length}（至少需要 3 帧）`);
-      return;
-    }
-    if (!result) {
-      setConfirmError("请先点击 Evaluate 得到评估结果，再进行 Confirm。");
-      return;
-    }
-    if (isConfirming) return;
-
-    const ok = window.confirm("将调用大模型确认（可能产生费用），是否继续？");
-    if (!ok) return;
-
-    setIsConfirming(true);
-
-    try {
-      const payload = {
-        action,
-        frames,
-        standard_seq: standardReadyRef.current ? standardSeqRef.current : null,
-        eval_result: result,
-      };
-
-      const resp = await fetchWithTimeout(
-        LLM_CONFIRM_API,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        },
-        LLM_TIMEOUT_MS
-      );
-
-      const text = await resp.text();
-      if (!resp.ok) {
-        setConfirmError(`HTTP ${resp.status}:\n${text}`);
-        return;
-      }
-      try {
-        setConfirmResult(JSON.parse(text));
-      } catch {
-        setConfirmResult({ raw: text });
-      }
-    } catch (e: any) {
-      if (e?.name === "AbortError") {
-        setConfirmError(`Confirm 超时（${LLM_TIMEOUT_MS}ms）。`);
-      } else {
-        setConfirmError("Confirm 失败：" + String(e?.message || e));
-      }
-    } finally {
-      setIsConfirming(false);
-    }
+  if (!captureDoneRef.current) {
+    setConfirmError(`还没采集满 ${TARGET_DURATION_MS / 1000}s，请继续保持动作...`);
+    return;
   }
 
+  const frames = framesRef.current;
+  if (frames.length < 3) {
+    setConfirmError(`有效帧过少：${frames.length}（至少需要 3 帧）`);
+    return;
+  }
+
+  if (!result) {
+    setConfirmError("请先点击 Evaluate 得到评估结果，再进行 Confirm。");
+    return;
+  }
+
+  if (isConfirming) return;
+
+  // 新增：关键帧检查（视觉复核需要）
+  const stdImgs = stdKeyframesRef.current || [];
+  const usrImgs = userKeyframesRef.current || [];
+
+  if (stdImgs.length < 2) {
+    setConfirmError(`标准关键帧不足：${stdImgs.length}（至少需要 2 张，建议 5 张）`);
+    return;
+  }
+  if (usrImgs.length < 2) {
+    setConfirmError(`用户关键帧不足：${usrImgs.length}（至少需要 2 张，建议 5 张）`);
+    return;
+  }
+
+  const ok = window.confirm("将调用大模型进行关键帧对比确认（可能产生费用），是否继续？");
+  if (!ok) return;
+
+  setIsConfirming(true);
+
+  try {
+    const payload = {
+      action,
+
+      // 旧逻辑字段（兼容）
+      frames,
+      standard_seq: standardReadyRef.current ? standardSeqRef.current : null,
+      eval_result: result,
+
+      // 新逻辑字段：发送关键帧图片给后端（视觉复核）
+      standard_images: stdImgs,
+      user_images: usrImgs,
+    };
+
+    const resp = await fetchWithTimeout(
+      LLM_CONFIRM_API,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      },
+      LLM_TIMEOUT_MS
+    );
+
+    const text = await resp.text();
+    if (!resp.ok) {
+      setConfirmError(`HTTP ${resp.status}:\n${text}`);
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(text);
+      setConfirmResult(parsed);
+
+      // 可选：控制台打印后端保存目录，方便你排查
+      const savedDir =
+        parsed?.saved_frames?.session_dir ||
+        parsed?.llm_confirm?.saved_frames?.session_dir;
+      if (savedDir) {
+        console.log("[Confirm] saved compare frames:", savedDir);
+      }
+    } catch {
+      setConfirmResult({ raw: text });
+    }
+  } catch (e: any) {
+    if (e?.name === "AbortError") {
+      setConfirmError(`Confirm 超时（${LLM_TIMEOUT_MS}ms）。`);
+    } else {
+      setConfirmError("Confirm 失败：" + String(e?.message || e));
+    }
+  } finally {
+    setIsConfirming(false);
+  }
+}
   // ====== UI ======
   return (
     <div
@@ -843,7 +956,10 @@ export default function App() {
             {poseDetected ? "✅" : "❌"} ｜ Hands: {handsDetected ? "✅" : "❌"} ｜ Std:{" "}
             {standardReadyRef.current ? "✅" : "⌛"}
           </div>
-
+          {/*临时测试*/}
+          <div>
+            StdKeyframes: {stdKeyframesRef.current.length} | UserKeyframes: {userKeyframesRef.current.length}
+          </div>
           <div style={{ position: "relative", marginTop: 12 }}>
             <video
               ref={userVideoRef}
