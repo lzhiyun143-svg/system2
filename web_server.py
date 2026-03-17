@@ -15,10 +15,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from pose_analysis.evaluator import PoseEvaluator, Frame
+import sys
+import subprocess
+import tempfile
+import shutil
 
 # OpenAI SDK（兼容 DashScope compatible-mode）
 from openai import OpenAI
-
+import uuid
+import threading
+import requests
+from fastapi import UploadFile, File, Form
+from fastapi.staticfiles import StaticFiles
 
 # =========================
 # Config (ENV)
@@ -31,7 +39,12 @@ DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")  # 必须在环境变量�
 DASHSCOPE_MODEL = os.getenv("DASHSCOPE_MODEL", "qwen-plus")  # 可换 qwen-max
 DASHSCOPE_VL_MODEL = os.getenv("DASHSCOPE_VL_MODEL", "qwen-vl-plus")
 STANDARD_DIR = os.getenv("STANDARD_DIR", "./standards")
+MUSETALK_API_BASE = os.getenv("MUSETALK_API_BASE", "http://127.0.0.1:19000")  # 你本地转发后的 MuseTalk API
+GENERATED_DIR = Path(os.getenv("GENERATED_DIR", "./generated"))
+GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 
+# ⚠️ 你现在 MuseTalk 服务是固定槽位 data/video/output.mp4 + data/audio/output.wav，不支持并发
+MUSETALK_LOCK = threading.Lock()
 
 # 安全：限制喂给 LLM 的最大 comment 数量/长度，避免 payload 过大
 MAX_RULE_COMMENTS = int(os.getenv("MAX_RULE_COMMENTS", "6"))
@@ -48,12 +61,17 @@ app = FastAPI(title="Rehab Web Server", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 本地开发先放开；上线请改成你的域名
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+app.mount("/generated", StaticFiles(directory=str(GENERATED_DIR)), name="generated")
 
 # =========================
 # Build evaluator safely
@@ -245,6 +263,42 @@ def llm_confirm_judge(action: str, eval_result: Dict[str, Any]) -> Dict[str, Any
             "latency_sec": round(latency, 3),
             "raw": text,
         }
+    
+def tts_text_to_wav(text: str, out_wav: Path) -> None:
+    """
+    文本 -> wav(16k/mono, pcm_s16le)
+    依赖：edge-tts + ffmpeg
+    安装：pip install edge-tts
+    """
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("Empty TTS text")
+
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1) edge-tts 先生成 mp3
+    tmp_mp3 = out_wav.with_suffix(".mp3")
+    try:
+        cmd = [
+            sys.executable, "-m", "edge_tts",
+            "--text", text,
+            "--voice", os.getenv("TTS_VOICE", "zh-CN-XiaoxiaoNeural"),
+            "--write-media", str(tmp_mp3),
+        ]
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if p.returncode != 0 or (not tmp_mp3.exists()):
+            raise RuntimeError(p.stdout[-2000:])
+    except Exception as e:
+        raise RuntimeError(
+            f"TTS failed. Please `pip install edge-tts` and ensure network OK. Detail: {type(e).__name__}: {e}"
+        )
+
+    # 2) mp3 -> wav 16k mono
+    ff = os.getenv("FFMPEG_BIN", "ffmpeg")
+    cmd_ff = [ff, "-y", "-i", str(tmp_mp3), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(out_wav)]
+    p2 = subprocess.run(cmd_ff, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if p2.returncode != 0 or (not out_wav.exists()):
+        raise RuntimeError(f"ffmpeg convert failed: {p2.stdout[-2000:]}")
     
 
 # 视觉调用
@@ -613,3 +667,67 @@ def api_evaluate(req: EvalRequest) -> Dict[str, Any]:
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {type(e).__name__}: {e}")
+
+@app.post("/api/coach_video")
+def api_coach_video(
+    video: UploadFile = File(...),     # 标准视频（前端把 demoVideoSrc fetch 成文件上传）
+    text: str = Form(...),             # LLM 生成的教练反馈文本
+    version: str = Form("v1.5"),
+    mode: str = Form("normal"),
+) -> Dict[str, Any]:
+    """
+    1) text -> wav
+    2) video + wav -> MuseTalk
+    3) 保存 mp4 -> /generated/xxx.mp4
+    4) 返回 url
+    """
+    if not text.strip():
+        raise HTTPException(status_code=422, detail="text is empty")
+
+    # 生成一个唯一文件名
+    uid = uuid.uuid4().hex[:10]
+    out_mp4 = GENERATED_DIR / f"coach_{uid}.mp4"
+
+    with tempfile.TemporaryDirectory(prefix="coach_video_") as td:
+        td = Path(td)
+        in_video = td / (video.filename or "standard.mp4")
+        tts_wav = td / "tts.wav"
+
+        # 保存上传的视频
+        with open(in_video, "wb") as f:
+            shutil.copyfileobj(video.file, f)
+
+        # TTS -> wav
+        tts_text_to_wav(text, tts_wav)
+
+        # 调 MuseTalk（加锁，避免固定槽位覆盖）
+        with MUSETALK_LOCK:
+            url = MUSETALK_API_BASE.rstrip("/") + "/infer"
+            files = {
+                "video": (in_video.name, open(in_video, "rb"), "video/mp4"),
+                "audio": (tts_wav.name, open(tts_wav, "rb"), "audio/wav"),
+            }
+            data = {"version": version, "mode": mode}
+
+            try:
+                r = requests.post(url, data=data, files=files, timeout=1800)
+            finally:
+                # 关闭文件句柄
+                for _, fp, *_ in files.values():
+                    try:
+                        fp.close()
+                    except Exception:
+                        pass
+
+        if r.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"MuseTalk failed: {r.text[:1000]}")
+
+        # 保存结果
+        with open(out_mp4, "wb") as f:
+            f.write(r.content)
+
+    return {
+        "ok": True,
+        "url": f"/generated/{out_mp4.name}",
+        "text": text,
+    }

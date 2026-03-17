@@ -38,7 +38,7 @@ const HAND_TASK_URL =
 const EVAL_API = "/api/evaluate";
 const LLM_PING_API = "/api/llm_ping";
 const LLM_CONFIRM_API = "/api/confirm";
-
+const COACH_VIDEO_API = "http://127.0.0.1:8000/api/coach_video";
 
 // 标准视频（public/demos/raise_arm.mp4）
 const DEMO_VIDEO_BY_ACTION: Record<ActionName, string> = {
@@ -92,6 +92,9 @@ export default function App() {
 
   const demoVideoSrc = useMemo(() => DEMO_VIDEO_BY_ACTION[action], [action]);
 
+  const [stdOverrideSrc, setStdOverrideSrc] = useState<string | null>(null);
+  const [isCoachPlaying, setIsCoachPlaying] = useState(false);
+
   // DOM refs
   const userVideoRef = useRef<HTMLVideoElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
@@ -123,7 +126,8 @@ export default function App() {
 
   // stream
   const streamRef = useRef<MediaStream | null>(null);
-
+  
+  const stdPlayerRef = useRef<HTMLVideoElement | null>(null);
   // ====== 1) 初始化 MediaPipe ======
   useEffect(() => {
     let cancelled = false;
@@ -649,6 +653,57 @@ export default function App() {
     }
   }
 
+  async function playCoachVideoFromLLM() {
+  // 1) 取 LLM 文本（你 evaluate 返回里有 llm_feedback）
+  const feedbackText =
+    (result as any)?.llm_feedback ||
+    (confirmResult as any)?.llm_confirm?.overall ||
+    "";
+
+  if (!feedbackText.trim()) {
+    alert("没有可用的教练反馈文本（请先勾选用大模型生成教练反馈，并 Evaluate 一次）");
+    return;
+  }
+
+  setIsCoachPlaying(true);
+
+  try {
+    // 2) 把“标准视频URL”下载成 blob，再作为文件上传给后端
+    const vResp = await fetch(demoVideoSrc);
+    if (!vResp.ok) throw new Error("标准视频下载失败：" + vResp.status);
+    const vBlob = await vResp.blob();
+    const vFile = new File([vBlob], "standard.mp4", { type: "video/mp4" });
+
+    // 3) 调后端：video + text
+    const fd = new FormData();
+    fd.append("video", vFile);
+    fd.append("text", feedbackText);
+    fd.append("version", "v1.5");
+    fd.append("mode", "normal");
+
+    const resp = await fetch(COACH_VIDEO_API, { method: "POST", body: fd });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data?.detail || JSON.stringify(data));
+
+    // 4) 用返回的 mp4 覆盖标准视频 src 并播放
+    const url = "http://127.0.0.1:8000" + data.url + "?t=" + Date.now();
+    setStdOverrideSrc(url);
+
+    // 等 React 更新后再 play
+    setTimeout(() => {
+      const el = stdPlayerRef.current;
+      if (el) {
+        el.currentTime = 0;
+        el.play().catch(() => {});
+      }
+    }, 50);
+  } catch (e: any) {
+    alert("生成口播失败：" + (e?.message || String(e)));
+    setStdOverrideSrc(null);
+  } finally {
+    setIsCoachPlaying(false);
+  }
+}
   // ====== 6) Confirm (LLM)：可选（需要你后端实现 POST /api/confirm） ======
   async function confirmLLM() {
   setConfirmError("");
@@ -801,13 +856,14 @@ export default function App() {
             Standard Demo ({action})
           </div>
 
+          
           <video
-            src={demoVideoSrc}
+            ref={stdPlayerRef}
+            src={(stdOverrideSrc ?? demoVideoSrc) as string}
             controls
-            style={{
-              width: "100%",
-              borderRadius: 14,
-              background: "#111",
+            style={{ width: "100%", borderRadius: 12, background: "#000" }}
+            onEnded={() => {
+              if (stdOverrideSrc) setStdOverrideSrc(null);
             }}
           />
 
@@ -939,6 +995,13 @@ export default function App() {
               title="可选：需要后端实现 POST /api/confirm"
             >
               {isConfirming ? "Confirming..." : "Confirm (LLM)"}
+            </button>
+            
+            <button
+              onClick={playCoachVideoFromLLM}
+              disabled={isCoachPlaying}
+            >
+              {isCoachPlaying ? "生成口播中..." : "播放教练口播讲解"}
             </button>
 
             <label style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: 10, opacity: 0.9 }}>
