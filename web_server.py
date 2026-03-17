@@ -42,6 +42,8 @@ STANDARD_DIR = os.getenv("STANDARD_DIR", "./standards")
 MUSETALK_API_BASE = os.getenv("MUSETALK_API_BASE", "http://127.0.0.1:19000")  # 你本地转发后的 MuseTalk API
 GENERATED_DIR = Path(os.getenv("GENERATED_DIR", "./generated"))
 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+USER_VIDEO_DIR = Path(os.getenv("USER_VIDEO_DIR", "./user_templates"))
+USER_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 
 # ⚠️ 你现在 MuseTalk 服务是固定槽位 data/video/output.mp4 + data/audio/output.wav，不支持并发
 MUSETALK_LOCK = threading.Lock()
@@ -479,6 +481,76 @@ def save_json_file(path: Path, data: Dict[str, Any]):
         print(f"[save_json_file] failed: {e}")
 
 
+
+
+def normalize_user_name(name: str) -> str:
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("name is empty")
+    safe = re.sub(r"[^\u4e00-\u9fa5a-zA-Z0-9_-]", "_", name)
+    safe = safe.strip("_") or "user"
+    return safe[:50]
+
+
+def get_user_dir(name: str) -> Path:
+    return USER_VIDEO_DIR / normalize_user_name(name)
+
+
+def get_user_video_path(name: str) -> Path:
+    return get_user_dir(name) / "avatar.mp4"
+
+
+def get_user_meta_path(name: str) -> Path:
+    return get_user_dir(name) / "meta.json"
+
+
+def save_upload_to_path(src: UploadFile, dst: Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with open(dst, "wb") as f:
+        shutil.copyfileobj(src.file, f)
+
+
+def transcode_to_mp4(src_path: Path, dst_path: Path):
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(src_path),
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-movflags", "+faststart",
+        str(dst_path),
+    ]
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg not found. Please install ffmpeg and ensure it is in PATH.")
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or b"").decode("utf-8", errors="ignore")
+        raise RuntimeError(f"ffmpeg transcode failed: {err[:1000]}")
+
+
+def build_user_profile(name: str) -> Dict[str, Any]:
+    user_dir = get_user_dir(name)
+    video_path = get_user_video_path(name)
+    meta_path = get_user_meta_path(name)
+    meta: Dict[str, Any] = {}
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+    return {
+        "ok": True,
+        "user_name": name,
+        "safe_name": normalize_user_name(name),
+        "exists": video_path.exists(),
+        "video_path": str(video_path) if video_path.exists() else None,
+        "user_dir": str(user_dir),
+        "meta": meta,
+    }
+
 # =========================
 # Request/Response Models
 # =========================
@@ -511,9 +583,67 @@ class ConfirmRequest(BaseModel):
     user_images: Optional[List[str]] = None
 
 
+class CoachVideoRequest(BaseModel):
+    user_name: str
+    text: str
+    version: Optional[str] = "v1.5"
+    mode: Optional[str] = "normal"
+
+
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True}
+
+
+@app.get("/api/profile/check")
+def api_profile_check(name: str) -> Dict[str, Any]:
+    try:
+        return build_user_profile(name)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"profile check failed: {type(e).__name__}: {e}")
+
+
+@app.get("/api/profile/info")
+def api_profile_info(name: str) -> Dict[str, Any]:
+    try:
+        return build_user_profile(name)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"profile info failed: {type(e).__name__}: {e}")
+
+
+@app.post("/api/profile/register")
+async def api_profile_register(
+    name: str = Form(...),
+    video: UploadFile = File(...),
+) -> Dict[str, Any]:
+    try:
+        user_dir = get_user_dir(name)
+        user_dir.mkdir(parents=True, exist_ok=True)
+
+        raw_ext = Path(video.filename or "avatar.webm").suffix or ".webm"
+        raw_path = user_dir / f"raw{raw_ext}"
+        mp4_path = user_dir / "avatar.mp4"
+
+        save_upload_to_path(video, raw_path)
+        transcode_to_mp4(raw_path, mp4_path)
+
+        meta = {
+            "user_name": name,
+            "safe_name": normalize_user_name(name),
+            "video_path": str(mp4_path),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "source_filename": video.filename,
+        }
+        get_user_meta_path(name).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        return {
+            "ok": True,
+            "message": "profile registered",
+            "video_path": str(mp4_path),
+            "profile": build_user_profile(name),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"profile register failed: {type(e).__name__}: {e}")
 
 
 # =========================
@@ -667,6 +797,65 @@ def api_evaluate(req: EvalRequest) -> Dict[str, Any]:
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {type(e).__name__}: {e}")
+
+@app.post("/api/coach_video_v2")
+def api_coach_video_v2(req: CoachVideoRequest) -> Dict[str, Any]:
+    if not req.text.strip():
+        raise HTTPException(status_code=422, detail="text is empty")
+
+    try:
+        video_path = get_user_video_path(req.user_name)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"invalid user name: {e}")
+
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="user template video not found, please register first")
+
+    uid = uuid.uuid4().hex[:10]
+    safe_name = normalize_user_name(req.user_name)
+    out_mp4 = GENERATED_DIR / f"coach_{safe_name}_{uid}.mp4"
+
+    with tempfile.TemporaryDirectory(prefix="coach_video_") as td:
+        td = Path(td)
+        tts_wav = td / "tts.wav"
+
+        tts_text_to_wav(req.text, tts_wav)
+
+        with MUSETALK_LOCK:
+            url = MUSETALK_API_BASE.rstrip("/") + "/infer"
+            video_fp = open(video_path, "rb")
+            audio_fp = open(tts_wav, "rb")
+            files = {
+                "video": (video_path.name, video_fp, "video/mp4"),
+                "audio": (tts_wav.name, audio_fp, "audio/wav"),
+            }
+            data = {"version": req.version or "v1.5", "mode": req.mode or "normal"}
+            try:
+                r = requests.post(url, data=data, files=files, timeout=1800)
+            finally:
+                try:
+                    video_fp.close()
+                except Exception:
+                    pass
+                try:
+                    audio_fp.close()
+                except Exception:
+                    pass
+
+        if r.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"MuseTalk failed: {r.text[:1000]}")
+
+        with open(out_mp4, "wb") as f:
+            f.write(r.content)
+
+    return {
+        "ok": True,
+        "url": f"/generated/{out_mp4.name}",
+        "text": req.text,
+        "user_name": req.user_name,
+        "template_video": str(video_path),
+    }
+
 
 @app.post("/api/coach_video")
 def api_coach_video(

@@ -38,7 +38,9 @@ const HAND_TASK_URL =
 const EVAL_API = "/api/evaluate";
 const LLM_PING_API = "/api/llm_ping";
 const LLM_CONFIRM_API = "/api/confirm";
-const COACH_VIDEO_API = "http://127.0.0.1:8000/api/coach_video";
+const COACH_VIDEO_API = "http://127.0.0.1:8000/api/coach_video_v2";
+const PROFILE_CHECK_API = "http://127.0.0.1:8000/api/profile/check";
+const PROFILE_REGISTER_API = "http://127.0.0.1:8000/api/profile/register";
 
 // 标准视频（public/demos/raise_arm.mp4）
 const DEMO_VIDEO_BY_ACTION: Record<ActionName, string> = {
@@ -61,7 +63,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   }
 }
 
-export default function App() {
+function RehabMain({ userName }: { userName: string }) {
   const [action, setAction] = useState<ActionName>("raise_arm");
 
   const [mpStatus, setMpStatus] = useState<"idle" | "loading" | "ready" | "error">(
@@ -654,7 +656,6 @@ export default function App() {
   }
 
   async function playCoachVideoFromLLM() {
-  // 1) 取 LLM 文本（你 evaluate 返回里有 llm_feedback）
   const feedbackText =
     (result as any)?.llm_feedback ||
     (confirmResult as any)?.llm_confirm?.overall ||
@@ -668,28 +669,22 @@ export default function App() {
   setIsCoachPlaying(true);
 
   try {
-    // 2) 把“标准视频URL”下载成 blob，再作为文件上传给后端
-    const vResp = await fetch(demoVideoSrc);
-    if (!vResp.ok) throw new Error("标准视频下载失败：" + vResp.status);
-    const vBlob = await vResp.blob();
-    const vFile = new File([vBlob], "standard.mp4", { type: "video/mp4" });
-
-    // 3) 调后端：video + text
-    const fd = new FormData();
-    fd.append("video", vFile);
-    fd.append("text", feedbackText);
-    fd.append("version", "v1.5");
-    fd.append("mode", "normal");
-
-    const resp = await fetch(COACH_VIDEO_API, { method: "POST", body: fd });
+    const resp = await fetch(COACH_VIDEO_API, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        user_name: userName,
+        text: feedbackText,
+        version: "v1.5",
+        mode: "normal",
+      }),
+    });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data?.detail || JSON.stringify(data));
 
-    // 4) 用返回的 mp4 覆盖标准视频 src 并播放
     const url = "http://127.0.0.1:8000" + data.url + "?t=" + Date.now();
     setStdOverrideSrc(url);
 
-    // 等 React 更新后再 play
     setTimeout(() => {
       const el = stdPlayerRef.current;
       if (el) {
@@ -815,6 +810,9 @@ export default function App() {
       </h1>
       <div style={{ opacity: 0.8, marginTop: 8 }}>
         Camera → 3s window → {EVAL_API} → {LLM_CONFIRM_API}
+      </div>
+      <div style={{ marginTop: 10, opacity: 0.95 }}>
+        当前用户：<b>{userName}</b>（教练口播会自动使用该用户首次录制的 3 秒模板视频）
       </div>
 
       <div style={{ marginTop: 12, opacity: 0.9 }}>
@@ -1086,4 +1084,284 @@ export default function App() {
       </div>
     </div>
   );
+
 }
+
+type ProfileState = {
+  ok?: boolean;
+  exists?: boolean;
+  user_name?: string;
+  video_path?: string | null;
+};
+
+function App() {
+  const [inputName, setInputName] = useState<string>(() => localStorage.getItem("rehab_user_name") || "");
+  const [resolvedName, setResolvedName] = useState<string>("");
+  const [profile, setProfile] = useState<ProfileState | null>(null);
+  const [step, setStep] = useState<"entry" | "record" | "main">("entry");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const recorderVideoRef = useRef<HTMLVideoElement | null>(null);
+  const recorderStreamRef = useRef<MediaStream | null>(null);
+
+  useEffect(() => {
+    return () => {
+      recorderStreamRef.current?.getTracks().forEach((t) => t.stop());
+    };
+  }, []);
+
+  useEffect(() => {
+    if (step === "record") {
+      startRecorderPreview().catch((e) => {
+        setError(String(e?.message || e));
+      });
+    }
+  }, [step]);
+
+  async function checkProfile() {
+    const name = inputName.trim();
+    if (!name) {
+      setError("请先输入姓名");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const resp = await fetch(`${PROFILE_CHECK_API}?name=${encodeURIComponent(name)}`);
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data?.detail || JSON.stringify(data));
+      setResolvedName(name);
+      setProfile(data);
+      localStorage.setItem("rehab_user_name", name);
+      if (data.exists) {
+        setStep("main");
+      } else {
+        setStep("record");
+      }
+    } catch (e: any) {
+      setError(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startRecorderPreview() {
+    if (recorderStreamRef.current) {
+      recorderStreamRef.current.getTracks().forEach((t) => t.stop());
+      recorderStreamRef.current = null;
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    recorderStreamRef.current = stream;
+    if (recorderVideoRef.current) {
+      recorderVideoRef.current.srcObject = stream;
+      await recorderVideoRef.current.play().catch(() => {});
+    }
+  }
+
+  async function recordAndUpload() {
+    const name = resolvedName || inputName.trim();
+    if (!name) {
+      setError("姓名为空");
+      return;
+    }
+    if (!recorderStreamRef.current) {
+      await startRecorderPreview();
+    }
+
+    setBusy(true);
+    setError("");
+    try {
+      const stream = recorderStreamRef.current!;
+      const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
+        ? "video/webm;codecs=vp9,opus"
+        : "video/webm";
+      const chunks: BlobPart[] = [];
+      const recorder = new MediaRecorder(stream, { mimeType });
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+      };
+
+      const stopped = new Promise<void>((resolve) => {
+        recorder.onstop = () => resolve();
+      });
+
+      recorder.start();
+      await new Promise((resolve) => window.setTimeout(resolve, 3000));
+      recorder.stop();
+      await stopped;
+
+      const blob = new Blob(chunks, { type: mimeType });
+      const file = new File([blob], `${name}.webm`, { type: mimeType });
+      const fd = new FormData();
+      fd.append("name", name);
+      fd.append("video", file);
+
+      const resp = await fetch(PROFILE_REGISTER_API, { method: "POST", body: fd });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data?.detail || JSON.stringify(data));
+
+      setProfile(data?.profile || { exists: true, user_name: name });
+      setResolvedName(name);
+      localStorage.setItem("rehab_user_name", name);
+      recorderStreamRef.current?.getTracks().forEach((t) => t.stop());
+      recorderStreamRef.current = null;
+      setStep("main");
+    } catch (e: any) {
+      setError(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (step === "main") {
+    return <RehabMain userName={resolvedName || inputName.trim()} />;
+  }
+
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        background: "#0b0b0c",
+        color: "#fff",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 24,
+        fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial",
+      }}
+    >
+      <div
+        style={{
+          width: "min(720px, 100%)",
+          background: "rgba(255,255,255,0.04)",
+          border: "1px solid rgba(255,255,255,0.14)",
+          borderRadius: 20,
+          padding: 24,
+        }}
+      >
+        <h1 style={{ marginTop: 0, fontSize: 36 }}>Rehab Web MVP</h1>
+        <div style={{ opacity: 0.8, marginBottom: 18 }}>
+          进入系统前先输入姓名。若该姓名没有个人模板视频，则先录制一段 3 秒视频，之后 MuseTalk 会自动使用该用户对应视频。
+        </div>
+
+        {step === "entry" && (
+          <>
+            <div style={{ fontSize: 18, marginBottom: 8 }}>姓名</div>
+            <input
+              value={inputName}
+              onChange={(e) => setInputName(e.target.value)}
+              placeholder="请输入姓名，例如 Mike"
+              style={{
+                width: "100%",
+                padding: "12px 14px",
+                borderRadius: 12,
+                border: "1px solid rgba(255,255,255,0.18)",
+                background: "#151517",
+                color: "#fff",
+                fontSize: 16,
+                boxSizing: "border-box",
+              }}
+            />
+            <button
+              onClick={checkProfile}
+              disabled={busy}
+              style={{
+                marginTop: 16,
+                padding: "12px 18px",
+                borderRadius: 12,
+                border: "1px solid rgba(255,255,255,0.2)",
+                background: busy ? "#333" : "#111",
+                color: "#fff",
+                cursor: busy ? "not-allowed" : "pointer",
+              }}
+            >
+              {busy ? "检查中..." : "进入系统"}
+            </button>
+          </>
+        )}
+
+        {step === "record" && (
+          <>
+            <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 8 }}>
+              首次使用：请为 “{resolvedName}” 录制 3 秒个人模板视频
+            </div>
+            <div style={{ opacity: 0.78, marginBottom: 14 }}>
+              建议正脸、光线稳定、嘴部清晰。该视频只需首次录制一次，后面重启网页只需重新输入姓名即可自动匹配。
+            </div>
+            <div style={{ position: "relative", width: "100%" }}>
+              <video
+                ref={recorderVideoRef}
+                autoPlay
+                playsInline
+                muted
+                style={{ width: "100%", borderRadius: 14, background: "#000", transform: "scaleX(-1)", display: "block", minHeight: 320, objectFit: "cover" }}
+              />
+              <div
+                style={{
+                  position: "absolute",
+                  top: 12,
+                  left: 12,
+                  padding: "6px 10px",
+                  borderRadius: 999,
+                  background: "rgba(0,0,0,0.55)",
+                  border: "1px solid rgba(255,255,255,0.18)",
+                  fontSize: 13,
+                }}
+              >
+                摄像头实时预览
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 12, marginTop: 16, flexWrap: "wrap" }}>
+              <button
+                onClick={recordAndUpload}
+                disabled={busy}
+                style={{
+                  padding: "12px 18px",
+                  borderRadius: 12,
+                  border: "1px solid rgba(255,255,255,0.2)",
+                  background: busy ? "#333" : "#111",
+                  color: "#fff",
+                  cursor: busy ? "not-allowed" : "pointer",
+                }}
+              >
+                {busy ? "录制并上传中..." : "开始录制 3 秒并保存"}
+              </button>
+              <button
+                onClick={() => {
+                  recorderStreamRef.current?.getTracks().forEach((t) => t.stop());
+                  recorderStreamRef.current = null;
+                  setStep("entry");
+                }}
+                disabled={busy}
+                style={{
+                  padding: "12px 18px",
+                  borderRadius: 12,
+                  border: "1px solid rgba(255,255,255,0.2)",
+                  background: "#111",
+                  color: "#fff",
+                }}
+              >
+                返回
+              </button>
+            </div>
+          </>
+        )}
+
+        {profile && (
+          <div style={{ marginTop: 18, opacity: 0.75, whiteSpace: "pre-wrap" }}>
+            {JSON.stringify(profile, null, 2)}
+          </div>
+        )}
+
+        {error && (
+          <pre style={{ marginTop: 18, background: "#3a0b0b", border: "1px solid #ff5a5a", padding: 12, borderRadius: 12, whiteSpace: "pre-wrap" }}>
+            {error}
+          </pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default App;
