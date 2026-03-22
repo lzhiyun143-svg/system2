@@ -9,7 +9,6 @@ import {
 type ActionName = "raise_arm";
 
 type FramePayload = {
-  // 统一用 33x3 / 21x3（z 强制 0，避免 z 不一致导致误差爆炸）
   pose: number[][];
   left_hand: number[][];
   right_hand: number[][];
@@ -17,15 +16,24 @@ type FramePayload = {
 
 type EvalResponse = any;
 
+type ProfileState = {
+  ok?: boolean;
+  exists?: boolean;
+  user_name?: string;
+  video_path?: string | null;
+  photo_path?: string | null;
+  avatar_url?: string | null;
+  photo_url?: string | null;
+  profile?: any;
+};
+
 const ACTIONS: ActionName[] = ["raise_arm"];
 
-// ====== 采集策略：采满 3 秒 ======
-const TARGET_DURATION_MS = 3000; // 采集 3 秒
-const SAMPLE_INTERVAL_MS = 33; // ~30fps 采样（可改成 40/50 更省）
+const TARGET_DURATION_MS = 3000;
+const SAMPLE_INTERVAL_MS = 33;
 const EVAL_TIMEOUT_MS = 12_000;
 const LLM_TIMEOUT_MS = 20_000;
 
-// MediaPipe wasm & model（CDN，避免 public/models 缺文件导致 “Unable to open zip archive”）
 const MP_WASM_BASE =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm";
 
@@ -34,15 +42,16 @@ const POSE_TASK_URL =
 const HAND_TASK_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
-// 前端请求后端（走 vite proxy：/api -> http://127.0.0.1:8000）
+const API_BASE = "http://127.0.0.1:8000";
 const EVAL_API = "/api/evaluate";
 const LLM_PING_API = "/api/llm_ping";
 const LLM_CONFIRM_API = "/api/confirm";
-const COACH_VIDEO_API = "http://127.0.0.1:8000/api/coach_video_v2";
-const PROFILE_CHECK_API = "http://127.0.0.1:8000/api/profile/check";
-const PROFILE_REGISTER_API = "http://127.0.0.1:8000/api/profile/register";
+const COACH_VIDEO_API = `${API_BASE}/api/coach_video_v2`;
+const PROFILE_CHECK_API = `${API_BASE}/api/profile/check`;
+const PROFILE_REGISTER_V2_API = `${API_BASE}/api/profile/register_v2`;
+const STANDARD_INFO_API = `${API_BASE}/api/standard_video/info`;
+const STANDARD_BUILD_API = `${API_BASE}/api/standard_video/build`;
 
-// 标准视频（public/demos/raise_arm.mp4）
 const DEMO_VIDEO_BY_ACTION: Record<ActionName, string> = {
   raise_arm: "/demos/raise_arm.mp4",
 };
@@ -51,7 +60,12 @@ function clamp01(x: number) {
   return Math.max(0, Math.min(1, x));
 }
 
-// fetch + timeout 小工具
+function joinApiUrl(path?: string | null) {
+  if (!path) return "";
+  if (path.startsWith("http://") || path.startsWith("https://")) return path;
+  return `${API_BASE}${path}`;
+}
+
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number) {
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -78,7 +92,7 @@ function RehabMain({ userName }: { userName: string }) {
   const [framesBuffered, setFramesBuffered] = useState(0);
   const [isEvaluating, setIsEvaluating] = useState(false);
   const poseLmStdRef = useRef<PoseLandmarker | null>(null);
-  // ✅ LLM 状态
+
   const [isPinging, setIsPinging] = useState(false);
   const [pingResult, setPingResult] = useState<any | null>(null);
   const [pingError, setPingError] = useState<string>("");
@@ -90,47 +104,39 @@ function RehabMain({ userName }: { userName: string }) {
   const [result, setResult] = useState<EvalResponse | null>(null);
   const [evalError, setEvalError] = useState<string>("");
 
-  const [useLLM, setUseLLM] = useState<boolean>(true); // 默认打开
+  const [useLLM, setUseLLM] = useState<boolean>(true);
 
   const demoVideoSrc = useMemo(() => DEMO_VIDEO_BY_ACTION[action], [action]);
 
   const [stdOverrideSrc, setStdOverrideSrc] = useState<string | null>(null);
   const [isCoachPlaying, setIsCoachPlaying] = useState(false);
+  const [buildingStandard, setBuildingStandard] = useState(false);
+  const [statusText, setStatusText] = useState("");
 
-  // DOM refs
   const userVideoRef = useRef<HTMLVideoElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
-
-  // ✅ 标准视频隐藏 video（用于抽帧得到标准骨架序列）
   const standardVideoRef = useRef<HTMLVideoElement | null>(null);
+  const stdPlayerRef = useRef<HTMLVideoElement | null>(null);
 
-  // MediaPipe refs
   const poseLmRef = useRef<PoseLandmarker | null>(null);
   const handLmRef = useRef<HandLandmarker | null>(null);
   const drawingRef = useRef<DrawingUtils | null>(null);
 
-  // loop refs
   const rafRef = useRef<number | null>(null);
   const lastSampleTsRef = useRef<number>(0);
 
-  // frames buffer
   const framesRef = useRef<FramePayload[]>([]);
   const userKeyframesRef = useRef<string[]>([]);
   const stdKeyframesRef = useRef<string[]>([]);
 
-  // 采集窗口：3 秒
   const captureStartTsRef = useRef<number | null>(null);
   const captureDoneRef = useRef<boolean>(false);
 
-  // ✅ 标准序列（3秒）缓存
   const standardSeqRef = useRef<FramePayload[]>([]);
   const standardReadyRef = useRef<boolean>(false);
 
-  // stream
   const streamRef = useRef<MediaStream | null>(null);
-  
-  const stdPlayerRef = useRef<HTMLVideoElement | null>(null);
-  // ====== 1) 初始化 MediaPipe ======
+
   useEffect(() => {
     let cancelled = false;
 
@@ -141,7 +147,6 @@ function RehabMain({ userName }: { userName: string }) {
 
         const vision = await FilesetResolver.forVisionTasks(MP_WASM_BASE);
 
-        // ✅ 摄像头用
         const poseLmUser = await PoseLandmarker.createFromOptions(vision, {
           baseOptions: {
             modelAssetPath: POSE_TASK_URL,
@@ -154,7 +159,6 @@ function RehabMain({ userName }: { userName: string }) {
           minTrackingConfidence: 0.5,
         });
 
-        // ✅ 标准视频抽帧用（单独实例，避免 timestamp 互相打架）
         const poseLmStd = await PoseLandmarker.createFromOptions(vision, {
           baseOptions: {
             modelAssetPath: POSE_TASK_URL,
@@ -166,10 +170,6 @@ function RehabMain({ userName }: { userName: string }) {
           minPosePresenceConfidence: 0.5,
           minTrackingConfidence: 0.5,
         });
-
-        // 绑定到 ref
-        poseLmRef.current = poseLmUser;      // 你 step() 里摄像头 detectForVideo 用这个
-        poseLmStdRef.current = poseLmStd;    // 你 buildStandardSequence() 用这个
 
         const handLm = await HandLandmarker.createFromOptions(vision, {
           baseOptions: {
@@ -185,14 +185,10 @@ function RehabMain({ userName }: { userName: string }) {
 
         if (cancelled) return;
 
-        // ✅ 摄像头用
         poseLmRef.current = poseLmUser;
-
-        // ✅ 标准视频抽帧用
         poseLmStdRef.current = poseLmStd;
         handLmRef.current = handLm;
 
-        // drawing utils
         const canvas = overlayRef.current;
         if (canvas) {
           const ctx = canvas.getContext("2d");
@@ -215,136 +211,171 @@ function RehabMain({ userName }: { userName: string }) {
       cancelled = true;
     };
   }, []);
-  
-  //截图工具
+
+  async function ensureUserStandardVideo(currentUserName: string, currentAction: string) {
+    try {
+      setBuildingStandard(true);
+      setStatusText("正在检查个性化标准动作视频...");
+
+      const infoResp = await fetch(
+        `${STANDARD_INFO_API}?user_name=${encodeURIComponent(currentUserName)}&action=${encodeURIComponent(currentAction)}`
+      );
+      const info = await infoResp.json();
+
+      if (info.generated_exists && info.display_video_url) {
+        setStdOverrideSrc(joinApiUrl(info.display_video_url));
+        setStatusText("已加载个性化标准动作视频");
+        return;
+      }
+
+      setStatusText("正在生成个性化标准动作视频（MusePose）...");
+      const buildResp = await fetch(STANDARD_BUILD_API, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_name: currentUserName,
+          action: currentAction,
+          force: false,
+        }),
+      });
+
+      if (!buildResp.ok) {
+        const txt = await buildResp.text();
+        throw new Error(txt);
+      }
+
+      const buildData = await buildResp.json();
+      setStdOverrideSrc(joinApiUrl(buildData.video_url));
+      setStatusText("个性化标准动作视频生成完成");
+    } catch (e: any) {
+      console.error(e);
+      setStdOverrideSrc(null);
+      setStatusText(`生成失败，回退到原始标准视频：${e?.message || e}`);
+    } finally {
+      setBuildingStandard(false);
+    }
+  }
+
+  useEffect(() => {
+    if (userName) {
+      ensureUserStandardVideo(userName, action);
+    }
+  }, [userName, action]);
+
   function captureVideoFrameToDataURL(
-  video: HTMLVideoElement,
-  maxW = 480,
-  quality = 0.7
-): string | null {
-  const w = video.videoWidth;
-  const h = video.videoHeight;
-  if (!w || !h) return null;
+    video: HTMLVideoElement,
+    maxW = 480,
+    quality = 0.7
+  ): string | null {
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    if (!w || !h) return null;
 
-  const scale = Math.min(1, maxW / w);
-  const cw = Math.max(1, Math.round(w * scale));
-  const ch = Math.max(1, Math.round(h * scale));
+    const scale = Math.min(1, maxW / w);
+    const cw = Math.max(1, Math.round(w * scale));
+    const ch = Math.max(1, Math.round(h * scale));
 
-  const canvas = document.createElement("canvas");
-  canvas.width = cw;
-  canvas.height = ch;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return null;
+    const canvas = document.createElement("canvas");
+    canvas.width = cw;
+    canvas.height = ch;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
 
-  ctx.drawImage(video, 0, 0, cw, ch);
-  return canvas.toDataURL("image/jpeg", quality);
-}
+    ctx.drawImage(video, 0, 0, cw, ch);
+    return canvas.toDataURL("image/jpeg", quality);
+  }
 
-  //关键帧采样时间点工具
   function getKeyframeTargets(totalMs: number) {
     return [0, 0.25, 0.5, 0.75, 0.95].map((r) => r * totalMs);
   }
-  // ====== 1.5) 构建标准骨架序列（从标准视频抽帧，取3秒窗口） ======
+
   async function buildStandardSequence() {
-  standardReadyRef.current = false;
-  standardSeqRef.current = [];
-  stdKeyframesRef.current = []; // 新增：重建标准序列时清空标准关键帧
+    standardReadyRef.current = false;
+    standardSeqRef.current = [];
+    stdKeyframesRef.current = [];
 
-  const video = standardVideoRef.current;
-  const poseLm = poseLmStdRef.current;
-  if (!video || !poseLm) return;
+    const video = standardVideoRef.current;
+    const poseLm = poseLmStdRef.current;
+    if (!video || !poseLm) return;
 
-  // 确保加载完成
-  if (video.readyState < 2) {
-    await new Promise<void>((resolve) => {
-      const onLoaded = () => {
-        video.removeEventListener("loadeddata", onLoaded);
-        resolve();
-      };
-      video.addEventListener("loadeddata", onLoaded, { once: true });
-      video.load();
-    });
-  }
-
-  // 再兜底等一下 metadata（确保 videoWidth/videoHeight/duration 可用）
-  if (!video.videoWidth || !video.videoHeight || !video.duration) {
-    await new Promise<void>((resolve) => {
-      const onMeta = () => {
-        video.removeEventListener("loadedmetadata", onMeta);
-        resolve();
-      };
-      video.addEventListener("loadedmetadata", onMeta, { once: true });
-    }).catch(() => {});
-  }
-
-  const videoDurationMs = (video.duration || 3) * 1000;
-  const durMs = Math.min(TARGET_DURATION_MS, videoDurationMs);
-
-  const seq: FramePayload[] = [];
-  const baseTs = performance.now();
-
-  // 新增：关键帧目标时刻（标准视频也按固定比例取 5 张）
-  const keyTargets = getKeyframeTargets(durMs);
-  let nextKeyIdx = 0;
-
-  // 通过 seek 抽帧
-  for (let t = 0; t < durMs; t += SAMPLE_INTERVAL_MS) {
-    const ct = Math.min(video.duration || 3, t / 1000);
-    video.currentTime = ct;
-
-    await new Promise<void>((resolve) => {
-      const onSeeked = () => {
-        video.removeEventListener("seeked", onSeeked);
-        resolve();
-      };
-      video.addEventListener("seeked", onSeeked, { once: true });
-    });
-
-    // 新增：先尝试截标准关键帧（不依赖是否检测到骨架，避免漏图）
-    if (nextKeyIdx < keyTargets.length && t >= keyTargets[nextKeyIdx]) {
-      const img = captureVideoFrameToDataURL(video, 480, 0.7);
-      if (img) stdKeyframesRef.current.push(img);
-      nextKeyIdx += 1;
+    if (video.readyState < 2) {
+      await new Promise<void>((resolve) => {
+        const onLoaded = () => {
+          video.removeEventListener("loadeddata", onLoaded);
+          resolve();
+        };
+        video.addEventListener("loadeddata", onLoaded, { once: true });
+        video.load();
+      });
     }
 
-    const ts = baseTs + t;
-    const poseRes = poseLm.detectForVideo(video, ts);
-    const posePts = poseRes.landmarks?.[0];
-    if (!posePts) continue;
+    if (!video.videoWidth || !video.videoHeight || !video.duration) {
+      await new Promise<void>((resolve) => {
+        const onMeta = () => {
+          video.removeEventListener("loadedmetadata", onMeta);
+          resolve();
+        };
+        video.addEventListener("loadedmetadata", onMeta, { once: true });
+      }).catch(() => {});
+    }
 
-    const pose33x3 = posePts.map((p: any) => [clamp01(p.x), clamp01(p.y), 0.0]);
-    seq.push({
-      pose: pose33x3,
-      left_hand: [],
-      right_hand: [],
-    });
+    const videoDurationMs = (video.duration || 3) * 1000;
+    const durMs = Math.min(TARGET_DURATION_MS, videoDurationMs);
+
+    const seq: FramePayload[] = [];
+    const baseTs = performance.now();
+    const keyTargets = getKeyframeTargets(durMs);
+    let nextKeyIdx = 0;
+
+    for (let t = 0; t < durMs; t += SAMPLE_INTERVAL_MS) {
+      const ct = Math.min(video.duration || 3, t / 1000);
+      video.currentTime = ct;
+
+      await new Promise<void>((resolve) => {
+        const onSeeked = () => {
+          video.removeEventListener("seeked", onSeeked);
+          resolve();
+        };
+        video.addEventListener("seeked", onSeeked, { once: true });
+      });
+
+      if (nextKeyIdx < keyTargets.length && t >= keyTargets[nextKeyIdx]) {
+        const img = captureVideoFrameToDataURL(video, 480, 0.7);
+        if (img) stdKeyframesRef.current.push(img);
+        nextKeyIdx += 1;
+      }
+
+      const ts = baseTs + t;
+      const poseRes = poseLm.detectForVideo(video, ts);
+      const posePts = poseRes.landmarks?.[0];
+      if (!posePts) continue;
+
+      const pose33x3 = posePts.map((p: any) => [clamp01(p.x), clamp01(p.y), 0.0]);
+      seq.push({
+        pose: pose33x3,
+        left_hand: [],
+        right_hand: [],
+      });
+    }
+
+    while (stdKeyframesRef.current.length < keyTargets.length) {
+      const img = captureVideoFrameToDataURL(video, 480, 0.7);
+      if (!img) break;
+      stdKeyframesRef.current.push(img);
+    }
+
+    standardSeqRef.current = seq;
+    standardReadyRef.current = seq.length >= 3;
   }
 
-  // 兜底：如果因为步长/时序原因关键帧不足，补到 5 张（尽量补当前帧）
-  while (stdKeyframesRef.current.length < keyTargets.length) {
-    const img = captureVideoFrameToDataURL(video, 480, 0.7);
-    if (!img) break;
-    stdKeyframesRef.current.push(img);
-  }
-
-  standardSeqRef.current = seq;
-  standardReadyRef.current = seq.length >= 3;
-
-  // 可选调试日志（建议先留着，确认采样正常后再删）
-  console.log("[buildStandardSequence] seq:", seq.length, "stdKeyframes:", stdKeyframesRef.current.length);
-}
-
-  // MediaPipe ready + action变化后，自动重建标准序列
   useEffect(() => {
     if (mpStatus !== "ready") return;
     buildStandardSequence().catch(() => {
       standardReadyRef.current = false;
       standardSeqRef.current = [];
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mpStatus, action]);
+  }, [mpStatus, action, demoVideoSrc]);
 
-  // ====== 2) 启动/停止摄像头 ======
   async function startCamera() {
     setEvalError("");
     setResult(null);
@@ -364,13 +395,12 @@ function RehabMain({ userName }: { userName: string }) {
       await video.play();
 
       setCameraOn(true);
-
-      // reset buffer + 3秒窗口
       framesRef.current = [];
       setFramesBuffered(0);
       lastSampleTsRef.current = 0;
       captureStartTsRef.current = null;
       captureDoneRef.current = false;
+      userKeyframesRef.current = [];
 
       startLoop();
     } catch (e: any) {
@@ -401,7 +431,6 @@ function RehabMain({ userName }: { userName: string }) {
     }
   }
 
-  // ====== 3) 检测循环（draw + buffer frames） ======
   function startLoop() {
     if (rafRef.current != null) return;
 
@@ -417,7 +446,6 @@ function RehabMain({ userName }: { userName: string }) {
       if (!video || !canvas || !poseLm || !handLm || !drawer) return;
       if (video.readyState < 2) return;
 
-      // overlay 跟 video 像素尺寸一致
       const vw = video.videoWidth || 0;
       const vh = video.videoHeight || 0;
       if (vw === 0 || vh === 0) return;
@@ -426,10 +454,8 @@ function RehabMain({ userName }: { userName: string }) {
 
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
-
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // ====== 检测 ======
       const poseRes = poseLm.detectForVideo(video, ts);
       const posePts = poseRes.landmarks?.[0] ?? null;
       const hasPose = !!posePts;
@@ -439,7 +465,6 @@ function RehabMain({ userName }: { userName: string }) {
       const hasHands = !!(handRes.landmarks && handRes.landmarks.length > 0);
       setHandsDetected(hasHands);
 
-      // ====== 左/右手分离（按 handedness） ======
       let leftHand: any[] | null = null;
       let rightHand: any[] | null = null;
       if (hasHands) {
@@ -459,12 +484,10 @@ function RehabMain({ userName }: { userName: string }) {
         }
       }
 
-      // ====== 画骨架（镜像画法：canvas 内部翻转，和 video 的镜像一致） ======
       ctx.save();
       ctx.translate(canvas.width, 0);
       ctx.scale(-1, 1);
 
-      // ✅ 先画标准骨架（绿色），再画用户骨架（白色），便于对齐
       if (standardReadyRef.current && captureStartTsRef.current != null) {
         const elapsed = ts - captureStartTsRef.current;
         const idx = Math.min(
@@ -474,9 +497,7 @@ function RehabMain({ userName }: { userName: string }) {
         const stdPose = standardSeqRef.current[idx]?.pose;
 
         if (stdPose && stdPose.length === 33) {
-          // ✅ 标准骨架也镜像：x' = 1 - x（因为我们在 canvas 里做了 translate+scale(-1,1)）
           const stdLandmarks = stdPose.map(([x, y]) => ({ x: 1 - x, y, z: 0 }));
-          // DrawingUtils 在不同版本里参数类型略有差异，这里用 any 兼容
           drawer.drawLandmarks(stdLandmarks as any, { radius: 3, color: "#00ff66" } as any);
           drawer.drawConnectors(
             stdLandmarks as any,
@@ -486,7 +507,6 @@ function RehabMain({ userName }: { userName: string }) {
         }
       }
 
-      // 用户骨架（默认白色）
       if (posePts) {
         drawer.drawLandmarks(posePts, { radius: 3 } as any);
         drawer.drawConnectors(posePts, PoseLandmarker.POSE_CONNECTIONS);
@@ -502,52 +522,34 @@ function RehabMain({ userName }: { userName: string }) {
 
       ctx.restore();
 
-     // ====== 采样入 buffer：采满 3 秒全帧 ======
       if (!posePts) return;
 
-      // 第一次开始采样
       if (captureStartTsRef.current == null) {
         captureStartTsRef.current = ts;
-        userKeyframesRef.current = []; // 新增：开始新一轮采样时清空用户关键帧
+        userKeyframesRef.current = [];
       }
 
       const elapsed = ts - captureStartTsRef.current;
-
-      // 采满 3 秒：停止采样（继续画即可）
       if (elapsed >= TARGET_DURATION_MS) {
         captureDoneRef.current = true;
         return;
       }
 
-     // 采样间隔控制
       if (ts - lastSampleTsRef.current < SAMPLE_INTERVAL_MS) return;
       lastSampleTsRef.current = ts;
 
-      // ====== 新增：按固定时刻抓用户关键帧（5张） ======
       const keyTargets = getKeyframeTargets(TARGET_DURATION_MS);
-      // 当前应抓第几张，就看 userKeyframesRef.current.length
       if (userKeyframesRef.current.length < keyTargets.length) {
         const nextTarget = keyTargets[userKeyframesRef.current.length];
-
-        // 到达下一个目标时刻就截图
-        // videoEl 用你当前循环里实际在读的用户视频元素变量名
         if (elapsed >= nextTarget) {
           const img = captureVideoFrameToDataURL(video, 480, 0.7);
-          if (img) {
-            userKeyframesRef.current.push(img);
-            // 可选调试
-            // console.log("[user keyframe]", userKeyframesRef.current.length, "elapsed=", Math.round(elapsed));
-          }
+          if (img) userKeyframesRef.current.push(img);
         }
       }
 
       const pose33x3 = posePts.map((p: any) => [clamp01(p.x), clamp01(p.y), 0.0]);
-      const left21x3 = leftHand
-        ? leftHand.map((p: any) => [clamp01(p.x), clamp01(p.y), 0.0])
-        : [];
-      const right21x3 = rightHand
-        ? rightHand.map((p: any) => [clamp01(p.x), clamp01(p.y), 0.0])
-        : [];
+      const left21x3 = leftHand ? leftHand.map((p: any) => [clamp01(p.x), clamp01(p.y), 0.0]) : [];
+      const right21x3 = rightHand ? rightHand.map((p: any) => [clamp01(p.x), clamp01(p.y), 0.0]) : [];
 
       framesRef.current.push({
         pose: pose33x3,
@@ -561,7 +563,6 @@ function RehabMain({ userName }: { userName: string }) {
     rafRef.current = requestAnimationFrame(step);
   }
 
-  // ====== 4) Evaluate：3秒采满后才允许 ======
   async function evaluate() {
     setEvalError("");
     setResult(null);
@@ -609,16 +610,14 @@ function RehabMain({ userName }: { userName: string }) {
       }
 
       try {
-        const json = JSON.parse(text);
-        setResult(json);
+        setResult(JSON.parse(text));
       } catch {
         setResult({ raw: text });
       }
     } catch (e: any) {
       if (e?.name === "AbortError") {
         setEvalError(
-          `请求超时（${EVAL_TIMEOUT_MS}ms）\n` +
-            `请确认后端 http://127.0.0.1:8000 正在运行，并且 /api/evaluate 没卡住。`
+          `请求超时（${EVAL_TIMEOUT_MS}ms）\n请确认后端 http://127.0.0.1:8000 正在运行，并且 /api/evaluate 没卡住。`
         );
       } else {
         setEvalError("请求失败：" + String(e?.message || e));
@@ -628,11 +627,9 @@ function RehabMain({ userName }: { userName: string }) {
     }
   }
 
-  // ====== 5) Ping LLM ======
   async function pingLLM() {
     setPingError("");
     setPingResult(null);
-
     if (isPinging) return;
     setIsPinging(true);
 
@@ -656,145 +653,132 @@ function RehabMain({ userName }: { userName: string }) {
   }
 
   async function playCoachVideoFromLLM() {
-  const feedbackText =
-    (result as any)?.llm_feedback ||
-    (confirmResult as any)?.llm_confirm?.overall ||
-    "";
+    const feedbackText =
+      (result as any)?.llm_feedback ||
+      (confirmResult as any)?.llm_confirm?.overall ||
+      "";
 
-  if (!feedbackText.trim()) {
-    alert("没有可用的教练反馈文本（请先勾选用大模型生成教练反馈，并 Evaluate 一次）");
-    return;
-  }
-
-  setIsCoachPlaying(true);
-
-  try {
-    const resp = await fetch(COACH_VIDEO_API, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        user_name: userName,
-        text: feedbackText,
-        version: "v1.5",
-        mode: "normal",
-      }),
-    });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data?.detail || JSON.stringify(data));
-
-    const url = "http://127.0.0.1:8000" + data.url + "?t=" + Date.now();
-    setStdOverrideSrc(url);
-
-    setTimeout(() => {
-      const el = stdPlayerRef.current;
-      if (el) {
-        el.currentTime = 0;
-        el.play().catch(() => {});
-      }
-    }, 50);
-  } catch (e: any) {
-    alert("生成口播失败：" + (e?.message || String(e)));
-    setStdOverrideSrc(null);
-  } finally {
-    setIsCoachPlaying(false);
-  }
-}
-  // ====== 6) Confirm (LLM)：可选（需要你后端实现 POST /api/confirm） ======
-  async function confirmLLM() {
-  setConfirmError("");
-  setConfirmResult(null);
-
-  if (!captureDoneRef.current) {
-    setConfirmError(`还没采集满 ${TARGET_DURATION_MS / 1000}s，请继续保持动作...`);
-    return;
-  }
-
-  const frames = framesRef.current;
-  if (frames.length < 3) {
-    setConfirmError(`有效帧过少：${frames.length}（至少需要 3 帧）`);
-    return;
-  }
-
-  if (!result) {
-    setConfirmError("请先点击 Evaluate 得到评估结果，再进行 Confirm。");
-    return;
-  }
-
-  if (isConfirming) return;
-
-  // 新增：关键帧检查（视觉复核需要）
-  const stdImgs = stdKeyframesRef.current || [];
-  const usrImgs = userKeyframesRef.current || [];
-
-  if (stdImgs.length < 2) {
-    setConfirmError(`标准关键帧不足：${stdImgs.length}（至少需要 2 张，建议 5 张）`);
-    return;
-  }
-  if (usrImgs.length < 2) {
-    setConfirmError(`用户关键帧不足：${usrImgs.length}（至少需要 2 张，建议 5 张）`);
-    return;
-  }
-
-  const ok = window.confirm("将调用大模型进行关键帧对比确认（可能产生费用），是否继续？");
-  if (!ok) return;
-
-  setIsConfirming(true);
-
-  try {
-    const payload = {
-      action,
-
-      // 旧逻辑字段（兼容）
-      frames,
-      standard_seq: standardReadyRef.current ? standardSeqRef.current : null,
-      eval_result: result,
-
-      // 新逻辑字段：发送关键帧图片给后端（视觉复核）
-      standard_images: stdImgs,
-      user_images: usrImgs,
-    };
-
-    const resp = await fetchWithTimeout(
-      LLM_CONFIRM_API,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      },
-      LLM_TIMEOUT_MS
-    );
-
-    const text = await resp.text();
-    if (!resp.ok) {
-      setConfirmError(`HTTP ${resp.status}:\n${text}`);
+    if (!feedbackText.trim()) {
+      alert("没有可用的教练反馈文本（请先勾选用大模型生成教练反馈，并 Evaluate 一次）");
       return;
     }
 
-    try {
-      const parsed = JSON.parse(text);
-      setConfirmResult(parsed);
+    setIsCoachPlaying(true);
 
-      // 可选：控制台打印后端保存目录，方便你排查
-      const savedDir =
-        parsed?.saved_frames?.session_dir ||
-        parsed?.llm_confirm?.saved_frames?.session_dir;
-      if (savedDir) {
-        console.log("[Confirm] saved compare frames:", savedDir);
-      }
-    } catch {
-      setConfirmResult({ raw: text });
+    try {
+      const resp = await fetch(COACH_VIDEO_API, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_name: userName,
+          text: feedbackText,
+          version: "v1.5",
+          mode: "normal",
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data?.detail || JSON.stringify(data));
+
+      const url = `${API_BASE}${data.url}?t=${Date.now()}`;
+      setStdOverrideSrc(url);
+
+      setTimeout(() => {
+        const el = stdPlayerRef.current;
+        if (el) {
+          el.currentTime = 0;
+          el.play().catch(() => {});
+        }
+      }, 50);
+    } catch (e: any) {
+      alert("生成口播失败：" + (e?.message || String(e)));
+      setStdOverrideSrc(null);
+    } finally {
+      setIsCoachPlaying(false);
     }
-  } catch (e: any) {
-    if (e?.name === "AbortError") {
-      setConfirmError(`Confirm 超时（${LLM_TIMEOUT_MS}ms）。`);
-    } else {
-      setConfirmError("Confirm 失败：" + String(e?.message || e));
-    }
-  } finally {
-    setIsConfirming(false);
   }
-}
-  // ====== UI ======
+
+  async function confirmLLM() {
+    setConfirmError("");
+    setConfirmResult(null);
+
+    if (!captureDoneRef.current) {
+      setConfirmError(`还没采集满 ${TARGET_DURATION_MS / 1000}s，请继续保持动作...`);
+      return;
+    }
+
+    const frames = framesRef.current;
+    if (frames.length < 3) {
+      setConfirmError(`有效帧过少：${frames.length}（至少需要 3 帧）`);
+      return;
+    }
+
+    if (!result) {
+      setConfirmError("请先点击 Evaluate 得到评估结果，再进行 Confirm。");
+      return;
+    }
+
+    if (isConfirming) return;
+
+    const stdImgs = stdKeyframesRef.current || [];
+    const usrImgs = userKeyframesRef.current || [];
+
+    if (stdImgs.length < 2) {
+      setConfirmError(`标准关键帧不足：${stdImgs.length}（至少需要 2 张，建议 5 张）`);
+      return;
+    }
+    if (usrImgs.length < 2) {
+      setConfirmError(`用户关键帧不足：${usrImgs.length}（至少需要 2 张，建议 5 张）`);
+      return;
+    }
+
+    const ok = window.confirm("将调用大模型进行关键帧对比确认（可能产生费用），是否继续？");
+    if (!ok) return;
+
+    setIsConfirming(true);
+
+    try {
+      const payload = {
+        action,
+        frames,
+        standard_seq: standardReadyRef.current ? standardSeqRef.current : null,
+        eval_result: result,
+        standard_images: stdImgs,
+        user_images: usrImgs,
+      };
+
+      const resp = await fetchWithTimeout(
+        LLM_CONFIRM_API,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        },
+        LLM_TIMEOUT_MS
+      );
+
+      const text = await resp.text();
+      if (!resp.ok) {
+        setConfirmError(`HTTP ${resp.status}:\n${text}`);
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(text);
+        setConfirmResult(parsed);
+      } catch {
+        setConfirmResult({ raw: text });
+      }
+    } catch (e: any) {
+      if (e?.name === "AbortError") {
+        setConfirmError(`Confirm 超时（${LLM_TIMEOUT_MS}ms）。`);
+      } else {
+        setConfirmError("Confirm 失败：" + String(e?.message || e));
+      }
+    } finally {
+      setIsConfirming(false);
+    }
+  }
+
   return (
     <div
       style={{
@@ -812,7 +796,7 @@ function RehabMain({ userName }: { userName: string }) {
         Camera → 3s window → {EVAL_API} → {LLM_CONFIRM_API}
       </div>
       <div style={{ marginTop: 10, opacity: 0.95 }}>
-        当前用户：<b>{userName}</b>（教练口播会自动使用该用户首次录制的 3 秒模板视频）
+        当前用户：<b>{userName}</b>
       </div>
 
       <div style={{ marginTop: 12, opacity: 0.9 }}>
@@ -833,6 +817,10 @@ function RehabMain({ userName }: { userName: string }) {
         )}
       </div>
 
+      <div style={{ marginTop: 12, opacity: 0.9 }}>
+        {buildingStandard ? "MusePose 处理中..." : statusText}
+      </div>
+
       <div
         style={{
           display: "grid",
@@ -841,7 +829,6 @@ function RehabMain({ userName }: { userName: string }) {
           marginTop: 18,
         }}
       >
-        {/* Left: Standard */}
         <div
           style={{
             border: "1px solid rgba(255,255,255,0.15)",
@@ -854,35 +841,33 @@ function RehabMain({ userName }: { userName: string }) {
             Standard Demo ({action})
           </div>
 
-          
           <video
             ref={stdPlayerRef}
-            src={(stdOverrideSrc ?? demoVideoSrc) as string}
+            src={stdOverrideSrc || demoVideoSrc}
             controls
+            autoPlay
+            loop
+            muted
+            playsInline
             style={{ width: "100%", borderRadius: 12, background: "#000" }}
-            onEnded={() => {
-              if (stdOverrideSrc) setStdOverrideSrc(null);
-            }}
           />
 
-          {/* ✅ 隐藏 video：用于抽帧构建标准骨架 */}
           <video
             ref={standardVideoRef}
             src={demoVideoSrc}
             muted
             playsInline
+            crossOrigin="anonymous"
+            preload="auto"
             style={{ display: "none" }}
           />
 
           <div style={{ marginTop: 10, opacity: 0.7 }}>
-            标准视频路径：{demoVideoSrc}
-            <div style={{ marginTop: 6 }}>
-              标准骨架：{standardReadyRef.current ? "✅ ready" : "⌛ building..."}
-            </div>
+            展示视频：{stdOverrideSrc || demoVideoSrc}
+            <div style={{ marginTop: 6 }}>标准骨架：{standardReadyRef.current ? "✅ ready" : "⌛ building..."}</div>
           </div>
         </div>
 
-        {/* Right: User */}
         <div
           style={{
             border: "1px solid rgba(255,255,255,0.15)",
@@ -990,37 +975,28 @@ function RehabMain({ userName }: { userName: string }) {
                     ? "not-allowed"
                     : "pointer",
               }}
-              title="可选：需要后端实现 POST /api/confirm"
             >
               {isConfirming ? "Confirming..." : "Confirm (LLM)"}
             </button>
-            
-            <button
-              onClick={playCoachVideoFromLLM}
-              disabled={isCoachPlaying}
-            >
+
+            <button onClick={playCoachVideoFromLLM} disabled={isCoachPlaying}>
               {isCoachPlaying ? "生成口播中..." : "播放教练口播讲解"}
             </button>
 
             <label style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: 10, opacity: 0.9 }}>
-              <input
-                type="checkbox"
-                checked={useLLM}
-                onChange={(e) => setUseLLM(e.target.checked)}
-              />
+              <input type="checkbox" checked={useLLM} onChange={(e) => setUseLLM(e.target.checked)} />
               用大模型生成教练反馈
             </label>
           </div>
 
           <div style={{ marginTop: 12, opacity: 0.75 }}>
-            Frames: {framesBuffered} ｜ Captured: {captureDoneRef.current ? "✅ 3s" : "⌛ collecting"} ｜ Pose:{" "}
-            {poseDetected ? "✅" : "❌"} ｜ Hands: {handsDetected ? "✅" : "❌"} ｜ Std:{" "}
-            {standardReadyRef.current ? "✅" : "⌛"}
+            Frames: {framesBuffered} ｜ Captured: {captureDoneRef.current ? "✅ 3s" : "⌛ collecting"} ｜ Pose: {poseDetected ? "✅" : "❌"} ｜ Hands: {handsDetected ? "✅" : "❌"} ｜ Std: {standardReadyRef.current ? "✅" : "⌛"}
           </div>
-          {/*临时测试*/}
+
           <div>
             StdKeyframes: {stdKeyframesRef.current.length} | UserKeyframes: {userKeyframesRef.current.length}
           </div>
+
           <div style={{ position: "relative", marginTop: 12 }}>
             <video
               ref={userVideoRef}
@@ -1045,9 +1021,7 @@ function RehabMain({ userName }: { userName: string }) {
             />
           </div>
 
-          <div style={{ marginTop: 14, fontSize: 22, fontWeight: 700 }}>
-            Result
-          </div>
+          <div style={{ marginTop: 14, fontSize: 22, fontWeight: 700 }}>Result</div>
 
           <div
             style={{
@@ -1062,37 +1036,13 @@ function RehabMain({ userName }: { userName: string }) {
               lineHeight: 1.4,
             }}
           >
-            {evalError ? (
-              evalError
-            ) : confirmError ? (
-              confirmError
-            ) : pingError ? (
-              pingError
-            ) : (
-              JSON.stringify(
-                {
-                  ping: pingResult ?? undefined,
-                  evaluate: result ?? undefined,
-                  confirm: confirmResult ?? undefined,
-                },
-                null,
-                2
-              )
-            )}
+            {evalError ? evalError : confirmError ? confirmError : pingError ? pingError : JSON.stringify({ ping: pingResult ?? undefined, evaluate: result ?? undefined, confirm: confirmResult ?? undefined }, null, 2)}
           </div>
         </div>
       </div>
     </div>
   );
-
 }
-
-type ProfileState = {
-  ok?: boolean;
-  exists?: boolean;
-  user_name?: string;
-  video_path?: string | null;
-};
 
 function App() {
   const [inputName, setInputName] = useState<string>(() => localStorage.getItem("rehab_user_name") || "");
@@ -1102,22 +1052,18 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
+  const [photoFile, setPhotoFile] = useState<File | null>(null);
+  const [previewPhotoUrl, setPreviewPhotoUrl] = useState<string>("");
+
   const recorderVideoRef = useRef<HTMLVideoElement | null>(null);
   const recorderStreamRef = useRef<MediaStream | null>(null);
 
   useEffect(() => {
     return () => {
       recorderStreamRef.current?.getTracks().forEach((t) => t.stop());
+      if (previewPhotoUrl) URL.revokeObjectURL(previewPhotoUrl);
     };
-  }, []);
-
-  useEffect(() => {
-    if (step === "record") {
-      startRecorderPreview().catch((e) => {
-        setError(String(e?.message || e));
-      });
-    }
-  }, [step]);
+  }, [previewPhotoUrl]);
 
   async function checkProfile() {
     const name = inputName.trim();
@@ -1159,10 +1105,22 @@ function App() {
     }
   }
 
-  async function recordAndUpload() {
+  useEffect(() => {
+    if (step === "record") {
+      startRecorderPreview().catch((e) => {
+        setError(String(e?.message || e));
+      });
+    }
+  }, [step]);
+
+  async function recordAndUploadV2() {
     const name = resolvedName || inputName.trim();
     if (!name) {
       setError("姓名为空");
+      return;
+    }
+    if (!photoFile) {
+      setError("请先上传一张个人照片");
       return;
     }
     if (!recorderStreamRef.current) {
@@ -1196,14 +1154,15 @@ function App() {
       const fd = new FormData();
       fd.append("name", name);
       fd.append("video", file);
+      fd.append("photo", photoFile);
 
-      const resp = await fetch(PROFILE_REGISTER_API, { method: "POST", body: fd });
+      const resp = await fetch(PROFILE_REGISTER_V2_API, { method: "POST", body: fd });
       const data = await resp.json();
       if (!resp.ok) throw new Error(data?.detail || JSON.stringify(data));
 
       setProfile(data?.profile || { exists: true, user_name: name });
-      setResolvedName(name);
-      localStorage.setItem("rehab_user_name", name);
+      setResolvedName(data?.profile?.user_name || name);
+      localStorage.setItem("rehab_user_name", data?.profile?.user_name || name);
       recorderStreamRef.current?.getTracks().forEach((t) => t.stop());
       recorderStreamRef.current = null;
       setStep("main");
@@ -1242,7 +1201,7 @@ function App() {
       >
         <h1 style={{ marginTop: 0, fontSize: 36 }}>Rehab Web MVP</h1>
         <div style={{ opacity: 0.8, marginBottom: 18 }}>
-          进入系统前先输入姓名。若该姓名没有个人模板视频，则先录制一段 3 秒视频，之后 MuseTalk 会自动使用该用户对应视频。
+          进入系统前先输入姓名。若该姓名没有个人模板视频，则先录制一段 3 秒视频并上传一张个人照片，之后标准动作展示会自动使用该用户对应的 MusePose 生成视频。
         </div>
 
         {step === "entry" && (
@@ -1284,18 +1243,55 @@ function App() {
         {step === "record" && (
           <>
             <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 8 }}>
-              首次使用：请为 “{resolvedName}” 录制 3 秒个人模板视频
+              首次使用：请为 “{resolvedName}” 录制 3 秒个人模板视频并上传一张照片
             </div>
             <div style={{ opacity: 0.78, marginBottom: 14 }}>
-              建议正脸、光线稳定、嘴部清晰。该视频只需首次录制一次，后面重启网页只需重新输入姓名即可自动匹配。
+              建议正脸、光线稳定、嘴部清晰。视频仅首次录制一次，照片用于生成个性化标准动作展示视频。
             </div>
+
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ marginBottom: 8, fontSize: 16 }}>上传个人照片</div>
+              <input
+                type="file"
+                accept="image/*"
+                onChange={(e) => {
+                  const f = e.target.files?.[0] || null;
+                  setPhotoFile(f);
+                  if (previewPhotoUrl) URL.revokeObjectURL(previewPhotoUrl);
+                  setPreviewPhotoUrl(f ? URL.createObjectURL(f) : "");
+                }}
+              />
+              {photoFile && (
+                <div style={{ marginTop: 8, opacity: 0.85 }}>
+                  已选择：{photoFile.name}
+                </div>
+              )}
+              {previewPhotoUrl && (
+                <div style={{ marginTop: 10 }}>
+                  <img
+                    src={previewPhotoUrl}
+                    alt="preview"
+                    style={{ width: 220, borderRadius: 12, display: "block" }}
+                  />
+                </div>
+              )}
+            </div>
+
             <div style={{ position: "relative", width: "100%" }}>
               <video
                 ref={recorderVideoRef}
                 autoPlay
                 playsInline
                 muted
-                style={{ width: "100%", borderRadius: 14, background: "#000", transform: "scaleX(-1)", display: "block", minHeight: 320, objectFit: "cover" }}
+                style={{
+                  width: "100%",
+                  borderRadius: 14,
+                  background: "#000",
+                  transform: "scaleX(-1)",
+                  display: "block",
+                  minHeight: 320,
+                  objectFit: "cover",
+                }}
               />
               <div
                 style={{
@@ -1312,9 +1308,10 @@ function App() {
                 摄像头实时预览
               </div>
             </div>
+
             <div style={{ display: "flex", gap: 12, marginTop: 16, flexWrap: "wrap" }}>
               <button
-                onClick={recordAndUpload}
+                onClick={recordAndUploadV2}
                 disabled={busy}
                 style={{
                   padding: "12px 18px",
@@ -1355,7 +1352,16 @@ function App() {
         )}
 
         {error && (
-          <pre style={{ marginTop: 18, background: "#3a0b0b", border: "1px solid #ff5a5a", padding: 12, borderRadius: 12, whiteSpace: "pre-wrap" }}>
+          <pre
+            style={{
+              marginTop: 18,
+              background: "#3a0b0b",
+              border: "1px solid #ff5a5a",
+              padding: 12,
+              borderRadius: 12,
+              whiteSpace: "pre-wrap",
+            }}
+          >
             {error}
           </pre>
         )}

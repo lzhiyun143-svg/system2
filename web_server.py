@@ -25,7 +25,7 @@ from openai import OpenAI
 import uuid
 import threading
 import requests
-from fastapi import UploadFile, File, Form
+from fastapi import UploadFile, File, Form, Query
 from fastapi.staticfiles import StaticFiles
 
 # =========================
@@ -40,10 +40,15 @@ DASHSCOPE_MODEL = os.getenv("DASHSCOPE_MODEL", "qwen-plus")  # 可换 qwen-max
 DASHSCOPE_VL_MODEL = os.getenv("DASHSCOPE_VL_MODEL", "qwen-vl-plus")
 STANDARD_DIR = os.getenv("STANDARD_DIR", "./standards")
 MUSETALK_API_BASE = os.getenv("MUSETALK_API_BASE", "http://127.0.0.1:19000")  # 你本地转发后的 MuseTalk API
+MUSEPOSE_API_BASE = os.getenv("MUSEPOSE_API_BASE", "http://127.0.0.1:19001").rstrip("/")#musepose
+MUSEPOSE_TIMEOUT = int(os.getenv("MUSEPOSE_TIMEOUT", "3600"))
+MUSEPOSE_LOCK = threading.Lock()
 GENERATED_DIR = Path(os.getenv("GENERATED_DIR", "./generated"))
 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 USER_VIDEO_DIR = Path(os.getenv("USER_VIDEO_DIR", "./user_templates"))
 USER_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+DEMO_ACTION_DIR = Path(os.getenv("DEMO_ACTION_DIR", "./demo_action")).resolve()
+
 
 # ⚠️ 你现在 MuseTalk 服务是固定槽位 data/video/output.mp4 + data/audio/output.wav，不支持并发
 MUSETALK_LOCK = threading.Lock()
@@ -74,7 +79,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.mount("/generated", StaticFiles(directory=str(GENERATED_DIR)), name="generated")
+app.mount("/user_templates", StaticFiles(directory=str(USER_VIDEO_DIR)), name="user_templates")
 
+if DEMO_ACTION_DIR.exists():
+    app.mount("/demo_action", StaticFiles(directory=str(DEMO_ACTION_DIR)), name="demo_action")
 # =========================
 # Build evaluator safely
 # - 兼容 PoseEvaluator() / PoseEvaluator(standard_dir=...) / PoseEvaluator(STANDARD_DIR)
@@ -348,7 +356,7 @@ def llm_confirm_judge_by_images(
 {{
   "is_pass": true,
   "confidence": 0.0,
-  "overall": "一句话总结",
+  "overall": "一句话总结，50字左右",
   "key_issues": ["问题1", "问题2"],
   "tips": ["建议1", "建议2", "建议3"]
 }}
@@ -433,6 +441,7 @@ def _save_dataurl_image(data_url: str, out_path: Path) -> bool:
         print(f"[save_dataurl_image] failed: {e}")
         return False
     
+    
 def save_compare_keyframes(
     action: str,
     standard_images: List[str],
@@ -503,6 +512,17 @@ def get_user_video_path(name: str) -> Path:
 def get_user_meta_path(name: str) -> Path:
     return get_user_dir(name) / "meta.json"
 
+def get_user_avatar_path(user_name: str) -> Path:
+    return get_user_dir(user_name) / "avatar.mp4"
+
+def get_user_photo_path(user_name: str) -> Path:
+    return get_user_dir(user_name) / "photo.jpg"
+
+
+def get_user_standard_dir(user_name: str) -> Path:
+    p = get_user_dir(user_name) / "standard_videos"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 def save_upload_to_path(src: UploadFile, dst: Path):
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -529,7 +549,35 @@ def transcode_to_mp4(src_path: Path, dst_path: Path):
     except subprocess.CalledProcessError as e:
         err = (e.stderr or b"").decode("utf-8", errors="ignore")
         raise RuntimeError(f"ffmpeg transcode failed: {err[:1000]}")
+    
+def image_to_jpg(src_path: Path, dst_path: Path) -> None:
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src_path, dst_path)
 
+def write_user_meta(user_name: str, meta: dict) -> None:
+    meta_path = get_user_meta_path(user_name)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+def read_user_meta(user_name: str) -> dict:
+    p = get_user_meta_path(user_name)
+    if not p.exists():
+        return {}
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def build_public_user_avatar_url(user_name: str) -> str:
+    safe = normalize_user_name(user_name)
+    return f"/user_templates/{safe}/avatar.mp4"
+
+
+def build_public_user_photo_url(user_name: str) -> str:
+    safe = normalize_user_name(user_name)
+    return f"/user_templates/{safe}/photo.jpg"
+
+
+def build_public_user_standard_url(user_name: str, action: str) -> str:
+    safe = normalize_user_name(user_name)
+    return f"/user_templates/{safe}/standard_videos/{action}.mp4"
 
 def build_user_profile(name: str) -> Dict[str, Any]:
     user_dir = get_user_dir(name)
@@ -550,6 +598,23 @@ def build_user_profile(name: str) -> Dict[str, Any]:
         "user_dir": str(user_dir),
         "meta": meta,
     }
+
+
+def get_demo_action_video_path(action: str) -> Path:
+    p = DEMO_ACTION_DIR / f"{action}.mp4"
+    if not p.exists():
+        raise FileNotFoundError(f"demo action video not found: {p}")
+    return p
+
+
+def get_user_standard_dir(user_name: str) -> Path:
+    p = get_user_dir(user_name) / "standard_videos"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def get_user_generated_standard_path(user_name: str, action: str) -> Path:
+    return get_user_standard_dir(user_name) / f"{action}.mp4"
 
 # =========================
 # Request/Response Models
@@ -589,6 +654,10 @@ class CoachVideoRequest(BaseModel):
     version: Optional[str] = "v1.5"
     mode: Optional[str] = "normal"
 
+class BuildStandardVideoRequest(BaseModel):
+    user_name: str
+    action: str
+    force: Optional[bool] = False
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
@@ -920,3 +989,185 @@ def api_coach_video(
         "url": f"/generated/{out_mp4.name}",
         "text": text,
     }
+
+@app.post("/api/profile/register_v2")
+async def api_profile_register_v2(
+    name: str = Form(...),
+    video: UploadFile = File(...),
+    photo: UploadFile = File(...),
+):
+    try:
+        safe_name = normalize_user_name(name)
+        user_dir = get_user_dir(name)
+        user_dir.mkdir(parents=True, exist_ok=True)
+
+        # 保存模板视频
+        video_suffix = Path(video.filename or "avatar.webm").suffix or ".webm"
+        raw_video_path = user_dir / f"avatar_raw{video_suffix}"
+        final_video_path = get_user_avatar_path(name)
+
+        save_upload_to_path(video, raw_video_path)
+        transcode_to_mp4(raw_video_path, final_video_path)
+
+        # 保存照片
+        photo_suffix = Path(photo.filename or "photo.jpg").suffix or ".jpg"
+        raw_photo_path = user_dir / f"photo_raw{photo_suffix}"
+        final_photo_path = get_user_photo_path(name)
+
+        save_upload_to_path(photo, raw_photo_path)
+        image_to_jpg(raw_photo_path, final_photo_path)
+
+        old_meta = read_user_meta(name)
+        standard_videos = old_meta.get("standard_videos", {})
+
+        meta = {
+            "user_name": name,
+            "safe_name": safe_name,
+            "created_at": old_meta.get("created_at") or datetime.now().isoformat(timespec="seconds"),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "avatar_path": str(final_video_path),
+            "photo_path": str(final_photo_path),
+            "avatar_url": build_public_user_avatar_url(name),
+            "photo_url": build_public_user_photo_url(name),
+            "standard_videos": standard_videos,
+        }
+        write_user_meta(name, meta)
+
+        return {
+            "ok": True,
+            "message": "profile registered",
+            "profile": meta,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"register_v2 failed: {type(e).__name__}: {e}")
+
+
+@app.get("/api/profile/info")
+def api_profile_info(user_name: str = Query(...)):
+    try:
+        meta = read_user_meta(user_name)
+        if not meta:
+            return {"ok": False, "exists": False}
+        return {"ok": True, "exists": True, "profile": meta}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"profile info failed: {type(e).__name__}: {e}")
+
+
+@app.get("/api/standard_video/info")
+def api_standard_video_info(
+    user_name: str = Query(...),
+    action: str = Query(...),
+):
+    try:
+        demo_video_path = get_demo_action_video_path(action)
+        generated_path = get_user_generated_standard_path(user_name, action)
+
+        return {
+            "ok": True,
+            "user_name": user_name,
+            "action": action,
+            "demo_video_url": f"/demo_action/{action}.mp4",
+            "demo_video_path": str(demo_video_path),
+            "generated_exists": generated_path.exists(),
+            "display_video_url": (
+                build_public_user_standard_url(user_name, action)
+                if generated_path.exists() else None
+            ),
+            "generated_video_path": str(generated_path),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"standard_video info failed: {type(e).__name__}: {e}")
+    
+
+
+@app.post("/api/standard_video/build")
+def api_standard_video_build(req: BuildStandardVideoRequest):
+    try:
+        user_name = req.user_name
+        action = req.action
+        force = bool(req.force)
+
+        photo_path = get_user_photo_path(user_name)
+        if not photo_path.exists():
+            raise HTTPException(status_code=404, detail="user photo not found, please register first")
+
+        demo_video_path = get_demo_action_video_path(action)
+        out_path = get_user_generated_standard_path(user_name, action)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if out_path.exists() and not force:
+            return {
+                "ok": True,
+                "cached": True,
+                "user_name": user_name,
+                "action": action,
+                "video_url": build_public_user_standard_url(user_name, action),
+                "local_path": str(out_path),
+            }
+
+        with MUSEPOSE_LOCK:
+            with open(photo_path, "rb") as f_img, open(demo_video_path, "rb") as f_vid:
+                files = {
+                    "photo": (photo_path.name, f_img, "image/jpeg"),
+                    "pose_video": (demo_video_path.name, f_vid, "video/mp4"),
+                }
+                data = {
+                    "action": action,
+                    "width": "512",
+                    "height": "512",
+                }
+                url = f"{MUSEPOSE_API_BASE}/infer"
+                resp = requests.post(
+                    url,
+                    files=files,
+                    data=data,
+                    timeout=MUSEPOSE_TIMEOUT,
+                )
+
+        if resp.status_code != 200:
+            raise RuntimeError(f"MusePose infer failed: {resp.status_code} {resp.text[:3000]}")
+
+        with open(out_path, "wb") as f:
+            f.write(resp.content)
+
+        meta = read_user_meta(user_name)
+        standard_videos = meta.get("standard_videos", {})
+        standard_videos[action] = {
+            "action": action,
+            "video_url": build_public_user_standard_url(user_name, action),
+            "local_path": str(out_path),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        meta["standard_videos"] = standard_videos
+        meta["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        write_user_meta(user_name, meta)
+
+        return {
+            "ok": True,
+            "cached": False,
+            "user_name": user_name,
+            "action": action,
+            "video_url": build_public_user_standard_url(user_name, action),
+            "local_path": str(out_path),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"standard_video build failed: {type(e).__name__}: {e}")
+    
+
+@app.get("/api/actions")
+def api_actions():
+    try:
+        if not DEMO_ACTION_DIR.exists():
+            return {"ok": True, "actions": []}
+
+        actions = []
+        for p in sorted(DEMO_ACTION_DIR.glob("*.mp4")):
+            actions.append({
+                "action": p.stem,
+                "video_url": f"/demo_action/{p.name}",
+            })
+        return {"ok": True, "actions": actions}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"list actions failed: {type(e).__name__}: {e}")

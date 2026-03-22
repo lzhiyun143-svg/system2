@@ -1,0 +1,18 @@
+{
+  "user_name": "lily",
+  "safe_name": "lily",
+  "created_at": "2026-03-21T17:14:41",
+  "updated_at": "2026-03-21T17:30:24",
+  "avatar_path": "user_templates\\lily\\avatar.mp4",
+  "photo_path": "user_templates\\lily\\photo.jpg",
+  "avatar_url": "/user_templates/lily/avatar.mp4",
+  "photo_url": "/user_templates/lily/photo.jpg",
+  "standard_videos": {
+    "raise_arm": {
+      "action": "raise_arm",
+      "video_url": "/user_templates/lily/standard_videos/raise_arm.mp4",
+      "local_path": "user_templates\\lily\\standard_videos\\raise_arm.mp4",
+      "updated_at": "2026-03-21T17:30:24"
+    }
+  }
+}
