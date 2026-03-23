@@ -1,7 +1,36 @@
 {
   "user_name": "lzy",
   "safe_name": "lzy",
-  "video_path": "user_templates\\lzy\\avatar.mp4",
-  "created_at": "2026-03-17T17:00:11",
-  "source_filename": "lzy.webm"
+  "created_at": "2026-03-23T21:46:29",
+  "updated_at": "2026-03-23T22:16:40",
+  "avatar_path": "D:\\谷歌下载\\system-main\\system-main\\user_templates\\lzy\\avatar.mp4",
+  "photo_path": "D:\\谷歌下载\\system-main\\system-main\\user_templates\\lzy\\photo.jpg",
+  "avatar_url": "/user_templates/lzy/avatar.mp4",
+  "photo_url": "/user_templates/lzy/photo.jpg",
+  "standard_videos": {
+    "raise_arm": {
+      "action": "raise_arm",
+      "updated_at": "2026-03-23T22:16:40",
+      "count": 2,
+      "items": [
+        {
+          "id": "pose2",
+          "source_demo_video_url": "/demo_action/raise_arm/pose2.mp4",
+          "cached": false,
+          "file_name": "001_pose2.mp4",
+          "video_url": "/user_templates/lzy/standard_videos/raise_arm/001_pose2.mp4",
+          "local_path": "D:\\谷歌下载\\system-main\\system-main\\user_templates\\lzy\\standard_videos\\raise_arm\\001_pose2.mp4"
+        },
+        {
+          "id": "raise_arm",
+          "source_demo_video_url": "/demo_action/raise_arm/raise_arm.mp4",
+          "cached": false,
+          "file_name": "002_raise_arm.mp4",
+          "video_url": "/user_templates/lzy/standard_videos/raise_arm/002_raise_arm.mp4",
+          "local_path": "D:\\谷歌下载\\system-main\\system-main\\user_templates\\lzy\\standard_videos\\raise_arm\\002_raise_arm.mp4"
+        }
+      ],
+      "errors": []
+    }
+  }
 }

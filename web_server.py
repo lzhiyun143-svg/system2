@@ -28,6 +28,7 @@ import requests
 from fastapi import UploadFile, File, Form, Query
 from fastapi.staticfiles import StaticFiles
 
+
 # =========================
 # Config (ENV)
 # =========================
@@ -35,20 +36,24 @@ DASHSCOPE_BASE_URL = os.getenv(
     "DASHSCOPE_BASE_URL",
     "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")  # 必须在环境变量里设置
-DASHSCOPE_MODEL = os.getenv("DASHSCOPE_MODEL", "qwen-plus")  # 可换 qwen-max
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
+DASHSCOPE_MODEL = os.getenv("DASHSCOPE_MODEL", "qwen-plus")
 DASHSCOPE_VL_MODEL = os.getenv("DASHSCOPE_VL_MODEL", "qwen-vl-plus")
+
 STANDARD_DIR = os.getenv("STANDARD_DIR", "./standards")
-MUSETALK_API_BASE = os.getenv("MUSETALK_API_BASE", "http://127.0.0.1:19000")  # 你本地转发后的 MuseTalk API
-MUSEPOSE_API_BASE = os.getenv("MUSEPOSE_API_BASE", "http://127.0.0.1:19001").rstrip("/")#musepose
+MUSETALK_API_BASE = os.getenv("MUSETALK_API_BASE", "http://127.0.0.1:19000")
+MUSEPOSE_API_BASE = os.getenv("MUSEPOSE_API_BASE", "http://127.0.0.1:19001").rstrip("/")
 MUSEPOSE_TIMEOUT = int(os.getenv("MUSEPOSE_TIMEOUT", "3600"))
 MUSEPOSE_LOCK = threading.Lock()
-GENERATED_DIR = Path(os.getenv("GENERATED_DIR", "./generated"))
-GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-USER_VIDEO_DIR = Path(os.getenv("USER_VIDEO_DIR", "./user_templates"))
-USER_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-DEMO_ACTION_DIR = Path(os.getenv("DEMO_ACTION_DIR", "./demo_action")).resolve()
 
+GENERATED_DIR = Path(os.getenv("GENERATED_DIR", "./generated")).resolve()
+GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+
+USER_VIDEO_DIR = Path(os.getenv("USER_VIDEO_DIR", "./user_templates")).resolve()
+USER_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+
+DEMO_ACTION_DIR = Path(os.getenv("DEMO_ACTION_DIR", "./demo_action")).resolve()
+DEMO_ACTION_DIR.mkdir(parents=True, exist_ok=True)
 
 # ⚠️ 你现在 MuseTalk 服务是固定槽位 data/video/output.mp4 + data/audio/output.wav，不支持并发
 MUSETALK_LOCK = threading.Lock()
@@ -58,13 +63,17 @@ MAX_RULE_COMMENTS = int(os.getenv("MAX_RULE_COMMENTS", "6"))
 MAX_COMMENT_CHARS = int(os.getenv("MAX_COMMENT_CHARS", "120"))
 
 # 图片保存路径
-COMPARE_FRAMES_DIR = Path("D:\system\system2_compare_frames")
+COMPARE_FRAMES_DIR = Path(r"D:\system\system2_compare_frames")
 COMPARE_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
 
 # =========================
 # FastAPI
 # =========================
-app = FastAPI(title="Rehab Web Server", version="0.3.0")
+app = FastAPI(title="Rehab Web Server", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -78,14 +87,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 app.mount("/generated", StaticFiles(directory=str(GENERATED_DIR)), name="generated")
 app.mount("/user_templates", StaticFiles(directory=str(USER_VIDEO_DIR)), name="user_templates")
 
 if DEMO_ACTION_DIR.exists():
     app.mount("/demo_action", StaticFiles(directory=str(DEMO_ACTION_DIR)), name="demo_action")
+
+
 # =========================
 # Build evaluator safely
-# - 兼容 PoseEvaluator() / PoseEvaluator(standard_dir=...) / PoseEvaluator(STANDARD_DIR)
 # =========================
 def build_evaluator() -> PoseEvaluator:
     try:
@@ -121,13 +132,11 @@ evaluator = build_evaluator()
 # =========================
 def get_llm_client() -> OpenAI:
     if not DASHSCOPE_API_KEY:
-        # 不要把 key 写在代码里；统一用环境变量
         raise RuntimeError("DASHSCOPE_API_KEY is not set in environment variables.")
     return OpenAI(api_key=DASHSCOPE_API_KEY, base_url=DASHSCOPE_BASE_URL)
 
 
 def llm_ping() -> Dict[str, Any]:
-    """用于确认：服务端是否真的能连上大模型（以及耗时）。"""
     t0 = time.time()
     client = get_llm_client()
 
@@ -164,9 +173,6 @@ def _trim_rule_comments(rule_comments: List[str]) -> List[str]:
 
 
 def llm_action_feedback(action: str, metric_out: Dict[str, Any]) -> str:
-    """
-    把规则/DTW 输出交给大模型，生成更像“教练”的自然语言反馈。
-    """
     client = get_llm_client()
 
     dtw_score = metric_out.get("dtw_score", None)
@@ -204,10 +210,6 @@ def llm_action_feedback(action: str, metric_out: Dict[str, Any]) -> str:
 
 
 def llm_confirm_judge(action: str, eval_result: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    LLM 复核：基于 evaluator 的结果，输出更“确定”的结论（是否合格/主要问题/建议）。
-    注意：不直接把全帧序列喂给 LLM，避免 payload 太大/泄露。
-    """
     client = get_llm_client()
 
     dtw_score = eval_result.get("dtw_score", None)
@@ -226,11 +228,11 @@ def llm_confirm_judge(action: str, eval_result: Dict[str, Any]) -> Dict[str, Any
 
 请你输出严格 JSON（只输出 JSON，不要任何多余文本），格式如下：
 {{
-  "is_pass": true/false,          // 是否基本达标（允许轻微误差）
-  "confidence": 0-1,              // 你对结论的把握
+  "is_pass": true/false,
+  "confidence": 0-1,
   "overall": "一句话总结",
-  "key_issues": ["问题1","问题2"], // 0-3条
-  "tips": ["建议1","建议2","建议3"] // 2-5条，尽量可执行
+  "key_issues": ["问题1","问题2"],
+  "tips": ["建议1","建议2","建议3"]
 }}
 
 要求：
@@ -251,8 +253,6 @@ def llm_confirm_judge(action: str, eval_result: Dict[str, Any]) -> Dict[str, Any
     latency = time.time() - t0
     text = (resp.choices[0].message.content or "").strip()
 
-    # 尝试解析 JSON（如果模型偶尔包了 ```json，也尽量兜底）
-    import json
     try:
         if text.startswith("```"):
             text = text.strip("`")
@@ -262,7 +262,6 @@ def llm_confirm_judge(action: str, eval_result: Dict[str, Any]) -> Dict[str, Any
         data["latency_sec"] = round(latency, 3)
         return data
     except Exception:
-        # 解析失败：返回 raw，便于你排查 prompt
         return {
             "is_pass": None,
             "confidence": 0.0,
@@ -273,20 +272,15 @@ def llm_confirm_judge(action: str, eval_result: Dict[str, Any]) -> Dict[str, Any
             "latency_sec": round(latency, 3),
             "raw": text,
         }
-    
+
+
 def tts_text_to_wav(text: str, out_wav: Path) -> None:
-    """
-    文本 -> wav(16k/mono, pcm_s16le)
-    依赖：edge-tts + ffmpeg
-    安装：pip install edge-tts
-    """
     text = (text or "").strip()
     if not text:
         raise RuntimeError("Empty TTS text")
 
     out_wav.parent.mkdir(parents=True, exist_ok=True)
 
-    # 1) edge-tts 先生成 mp3
     tmp_mp3 = out_wav.with_suffix(".mp3")
     try:
         cmd = [
@@ -303,24 +297,21 @@ def tts_text_to_wav(text: str, out_wav: Path) -> None:
             f"TTS failed. Please `pip install edge-tts` and ensure network OK. Detail: {type(e).__name__}: {e}"
         )
 
-    # 2) mp3 -> wav 16k mono
     ff = os.getenv("FFMPEG_BIN", "ffmpeg")
     cmd_ff = [ff, "-y", "-i", str(tmp_mp3), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(out_wav)]
     p2 = subprocess.run(cmd_ff, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if p2.returncode != 0 or (not out_wav.exists()):
         raise RuntimeError(f"ffmpeg convert failed: {p2.stdout[-2000:]}")
-    
 
-# 视觉调用
+
 def llm_confirm_judge_by_images(
     action: str,
     standard_images: List[str],
     user_images: List[str],
     eval_result: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    client = get_llm_client()  # 你原来已有的方法，保留
+    client = get_llm_client()
 
-    # 后端兜底限制，防止 payload 太大
     standard_images = (standard_images or [])[:6]
     user_images = (user_images or [])[:6]
 
@@ -337,7 +328,6 @@ def llm_confirm_judge_by_images(
 
     helper_text = ""
     if eval_result:
-        # 可选：把规则评估结果做辅助提示（截断避免太长）
         helper_text = f"\n规则评估辅助信息（可选参考）: {json.dumps(eval_result, ensure_ascii=False)[:700]}"
 
     prompt_text = f"""
@@ -370,13 +360,11 @@ def llm_confirm_judge_by_images(
 
     content_items = [{"type": "text", "text": prompt_text}]
 
-    # 标准帧
     content_items.append({"type": "text", "text": "下面是【标准动作关键帧】（按时间顺序）"})
     for i, img in enumerate(standard_images, 1):
         content_items.append({"type": "text", "text": f"标准帧{i}"})
         content_items.append({"type": "image_url", "image_url": {"url": img}})
 
-    # 用户帧
     content_items.append({"type": "text", "text": "下面是【用户动作关键帧】（按时间顺序）"})
     for i, img in enumerate(user_images, 1):
         content_items.append({"type": "text", "text": f"用户帧{i}"})
@@ -384,7 +372,7 @@ def llm_confirm_judge_by_images(
 
     t0 = time.time()
     resp = client.chat.completions.create(
-        model=DASHSCOPE_VL_MODEL,  # 注意这里用视觉模型
+        model=DASHSCOPE_VL_MODEL,
         messages=[
             {"role": "system", "content": "Return valid JSON only."},
             {"role": "user", "content": content_items},
@@ -420,11 +408,7 @@ def llm_confirm_judge_by_images(
         }
 
 
-
 def _save_dataurl_image(data_url: str, out_path: Path) -> bool:
-    """
-    支持 data:image/jpeg;base64,... / data:image/png;base64,...
-    """
     try:
         if not data_url or "," not in data_url:
             return False
@@ -440,8 +424,8 @@ def _save_dataurl_image(data_url: str, out_path: Path) -> bool:
     except Exception as e:
         print(f"[save_dataurl_image] failed: {e}")
         return False
-    
-    
+
+
 def save_compare_keyframes(
     action: str,
     standard_images: List[str],
@@ -483,6 +467,7 @@ def save_compare_keyframes(
         "saved_user_files": saved_usr,
     }
 
+
 def save_json_file(path: Path, data: Dict[str, Any]):
     try:
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -490,8 +475,9 @@ def save_json_file(path: Path, data: Dict[str, Any]):
         print(f"[save_json_file] failed: {e}")
 
 
-
-
+# =========================
+# User / path helpers
+# =========================
 def normalize_user_name(name: str) -> str:
     name = (name or "").strip()
     if not name:
@@ -512,8 +498,10 @@ def get_user_video_path(name: str) -> Path:
 def get_user_meta_path(name: str) -> Path:
     return get_user_dir(name) / "meta.json"
 
+
 def get_user_avatar_path(user_name: str) -> Path:
     return get_user_dir(user_name) / "avatar.mp4"
+
 
 def get_user_photo_path(user_name: str) -> Path:
     return get_user_dir(user_name) / "photo.jpg"
@@ -523,6 +511,13 @@ def get_user_standard_dir(user_name: str) -> Path:
     p = get_user_dir(user_name) / "standard_videos"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def get_user_standard_action_dir(user_name: str, action: str) -> Path:
+    p = get_user_standard_dir(user_name) / action
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
 
 def save_upload_to_path(src: UploadFile, dst: Path):
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -543,21 +538,25 @@ def transcode_to_mp4(src_path: Path, dst_path: Path):
         str(dst_path),
     ]
     try:
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
     except FileNotFoundError:
         raise RuntimeError("ffmpeg not found. Please install ffmpeg and ensure it is in PATH.")
     except subprocess.CalledProcessError as e:
         err = (e.stderr or b"").decode("utf-8", errors="ignore")
         raise RuntimeError(f"ffmpeg transcode failed: {err[:1000]}")
-    
+
+
 def image_to_jpg(src_path: Path, dst_path: Path) -> None:
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src_path, dst_path)
+
 
 def write_user_meta(user_name: str, meta: dict) -> None:
     meta_path = get_user_meta_path(user_name)
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def read_user_meta(user_name: str) -> dict:
     p = get_user_meta_path(user_name)
     if not p.exists():
@@ -575,9 +574,10 @@ def build_public_user_photo_url(user_name: str) -> str:
     return f"/user_templates/{safe}/photo.jpg"
 
 
-def build_public_user_standard_url(user_name: str, action: str) -> str:
+def build_public_user_standard_url(user_name: str, action: str, filename: str) -> str:
     safe = normalize_user_name(user_name)
-    return f"/user_templates/{safe}/standard_videos/{action}.mp4"
+    return f"/user_templates/{safe}/standard_videos/{action}/{filename}"
+
 
 def build_user_profile(name: str) -> Dict[str, Any]:
     user_dir = get_user_dir(name)
@@ -600,21 +600,116 @@ def build_user_profile(name: str) -> Dict[str, Any]:
     }
 
 
+# =========================
+# Demo action video helpers
+# 兼容两种目录结构：
+# 1) 旧版：demo_action/raise_arm.mp4
+# 2) 新版：demo_action/raise_arm/*.mp4
+# =========================
+def _is_video_file(p: Path) -> bool:
+    return p.is_file() and p.suffix.lower() in ALLOWED_VIDEO_EXTS
+
+
 def get_demo_action_video_path(action: str) -> Path:
-    p = DEMO_ACTION_DIR / f"{action}.mp4"
-    if not p.exists():
-        raise FileNotFoundError(f"demo action video not found: {p}")
-    return p
+    """
+    旧接口兼容：优先取 demo_action/{action}.mp4，
+    如果没有，则取 demo_action/{action}/ 下的第一个视频。
+    """
+    flat = DEMO_ACTION_DIR / f"{action}.mp4"
+    if flat.exists():
+        return flat
+
+    action_dir = DEMO_ACTION_DIR / action
+    if action_dir.exists() and action_dir.is_dir():
+        candidates = [p for p in sorted(action_dir.iterdir()) if _is_video_file(p)]
+        if candidates:
+            return candidates[0]
+
+    raise FileNotFoundError(f"demo action video not found for action={action}")
 
 
-def get_user_standard_dir(user_name: str) -> Path:
-    p = get_user_dir(user_name) / "standard_videos"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+def get_demo_action_video_paths(action: str) -> List[Path]:
+    """
+    新接口：返回某个动作下的所有标准视频。
+    兼容：
+    - demo_action/{action}.mp4
+    - demo_action/{action}/*.mp4
+    """
+    out: List[Path] = []
+
+    flat = DEMO_ACTION_DIR / f"{action}.mp4"
+    if flat.exists() and _is_video_file(flat):
+        out.append(flat)
+
+    action_dir = DEMO_ACTION_DIR / action
+    if action_dir.exists() and action_dir.is_dir():
+        for p in sorted(action_dir.iterdir()):
+            if _is_video_file(p):
+                out.append(p)
+
+    # 去重
+    uniq = []
+    seen = set()
+    for p in out:
+        key = str(p.resolve())
+        if key not in seen:
+            uniq.append(p)
+            seen.add(key)
+    return uniq
 
 
-def get_user_generated_standard_path(user_name: str, action: str) -> Path:
-    return get_user_standard_dir(user_name) / f"{action}.mp4"
+def get_demo_action_video_public_url(action: str, video_path: Path) -> str:
+    rel = video_path.relative_to(DEMO_ACTION_DIR).as_posix()
+    return f"/demo_action/{rel}"
+
+
+def get_demo_action_video_id(video_path: Path) -> str:
+    return video_path.stem
+
+
+def get_user_generated_standard_path(user_name: str, action: str, filename: str) -> Path:
+    return get_user_standard_action_dir(user_name, action) / filename
+
+
+def build_generated_standard_item(user_name: str, action: str, out_path: Path) -> Dict[str, Any]:
+    return {
+        "file_name": out_path.name,
+        "video_url": build_public_user_standard_url(user_name, action, out_path.name),
+        "local_path": str(out_path),
+    }
+
+
+def call_musepose_with_photo_and_video(
+    photo_path: Path,
+    pose_video_path: Path,
+    action: str,
+    width: str = "512",
+    height: str = "512",
+) -> bytes:
+    with MUSEPOSE_LOCK:
+        with open(photo_path, "rb") as f_img, open(pose_video_path, "rb") as f_vid:
+            files = {
+                "photo": (photo_path.name, f_img, "image/jpeg"),
+                "pose_video": (pose_video_path.name, f_vid, "video/mp4"),
+            }
+            data = {
+                "action": action,
+                "width": width,
+                "height": height,
+            }
+            url = f"{MUSEPOSE_API_BASE}/infer"
+            resp = requests.post(
+                url,
+                files=files,
+                data=data,
+                timeout=MUSEPOSE_TIMEOUT,
+            )
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"MusePose infer failed: {resp.status_code} {resp.text[:3000]}")
+
+    return resp.content
+
 
 # =========================
 # Request/Response Models
@@ -630,20 +725,14 @@ class EvalRequest(BaseModel):
     frames: Optional[List[FrameIn]] = None
     user_seq: Optional[List[FrameIn]] = None
     standard_seq: Optional[List[FrameIn]] = None
-
-    # 是否调用大模型给自然语言反馈
     use_llm: Optional[bool] = False
 
 
 class ConfirmRequest(BaseModel):
     action: str
-    # 你前端会传 frames
     frames: List[FrameIn]
-    # 可选：标准序列（你前端现在会传 standard_seq）
     standard_seq: Optional[List[FrameIn]] = None
-    # 前端把 /api/evaluate 的结果带上（推荐）
     eval_result: Dict[str, Any]
-
     standard_images: Optional[List[str]] = None
     user_images: Optional[List[str]] = None
 
@@ -654,10 +743,12 @@ class CoachVideoRequest(BaseModel):
     version: Optional[str] = "v1.5"
     mode: Optional[str] = "normal"
 
+
 class BuildStandardVideoRequest(BaseModel):
     user_name: str
     action: str
     force: Optional[bool] = False
+
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
@@ -672,8 +763,8 @@ def api_profile_check(name: str) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"profile check failed: {type(e).__name__}: {e}")
 
 
-@app.get("/api/profile/info")
-def api_profile_info(name: str) -> Dict[str, Any]:
+@app.get("/api/profile/info_legacy")
+def api_profile_info_legacy(name: str) -> Dict[str, Any]:
     try:
         return build_user_profile(name)
     except Exception as e:
@@ -729,7 +820,6 @@ def api_llm_ping() -> Dict[str, Any]:
         )
 
 
-# GET /api/confirm：保持“连通性确认”（避免你浏览器直接点返回 404）
 @app.get("/api/confirm")
 def api_confirm_get() -> Dict[str, Any]:
     try:
@@ -741,38 +831,29 @@ def api_confirm_get() -> Dict[str, Any]:
         )
 
 
-# POST /api/confirm：真正做“LLM 复核”
 @app.post("/api/confirm")
 def api_confirm_post(req: ConfirmRequest) -> Dict[str, Any]:
     try:
-        # 旧字段校验（兼容你的现有逻辑）
         if req.frames is not None and len(req.frames) < 3:
             raise HTTPException(status_code=400, detail="Too few valid frames (<3).")
 
-        # =========================
-        # 新模式：关键帧图像复核（优先）
-        # =========================
         if req.standard_images and req.user_images:
-            # 后端兜底限制，避免 payload 太大
             std_imgs = (req.standard_images or [])[:6]
             usr_imgs = (req.user_images or [])[:6]
 
-            # 1) 保存关键帧到专门文件夹
             save_info = save_compare_keyframes(
                 action=req.action,
                 standard_images=std_imgs,
                 user_images=usr_imgs,
             )
 
-            # 2) 视觉模型复核（看图对比）
             llm_out = llm_confirm_judge_by_images(
                 action=req.action,
                 standard_images=std_imgs,
                 user_images=usr_imgs,
-                eval_result=req.eval_result,  # 可选辅助
+                eval_result=req.eval_result,
             )
 
-            # 3) 保存结果（可选）
             try:
                 save_json_file(Path(save_info["session_dir"]) / "llm_result.json", llm_out)
             except Exception:
@@ -789,9 +870,6 @@ def api_confirm_post(req: ConfirmRequest) -> Dict[str, Any]:
                 },
             }
 
-        # =========================
-        # 旧模式：JSON 复核（兼容）
-        # =========================
         llm_out = llm_confirm_judge(req.action, req.eval_result or {})
 
         return {
@@ -807,8 +885,8 @@ def api_confirm_post(req: ConfirmRequest) -> Dict[str, Any]:
             status_code=500,
             detail=f"LLM confirm POST failed: {type(e).__name__}: {e}",
         )
-    
-    
+
+
 # =========================
 # Main evaluate endpoint
 # =========================
@@ -818,14 +896,12 @@ def api_evaluate(req: EvalRequest) -> Dict[str, Any]:
     if not user_in:
         raise HTTPException(status_code=422, detail="Field required: frames or user_seq")
 
-    # user frames
     user_frames = [
         Frame(pose=f.pose, left_hand=f.left_hand, right_hand=f.right_hand)
         for f in user_in
         if f.pose is not None
     ]
 
-    # standard frames（来自前端叠加抽帧的 3 秒全帧）
     std_frames = None
     if req.standard_seq:
         std_frames = [
@@ -844,7 +920,6 @@ def api_evaluate(req: EvalRequest) -> Dict[str, Any]:
             standard_frames=std_frames,
         )
 
-        # ✅ 追加一些 meta，帮助你确认“是否真的用上了 standard_seq”
         out["_meta"] = {
             "user_frames": len(user_frames),
             "standard_frames": len(std_frames) if std_frames is not None else 0,
@@ -852,7 +927,6 @@ def api_evaluate(req: EvalRequest) -> Dict[str, Any]:
             "use_llm_feedback": bool(req.use_llm),
         }
 
-        # 可选：让 LLM 生成教练反馈（和 confirm 不同：confirm 是“复核/达标判断”）
         if req.use_llm:
             try:
                 out["llm_feedback"] = llm_action_feedback(req.action, out)
@@ -866,6 +940,7 @@ def api_evaluate(req: EvalRequest) -> Dict[str, Any]:
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {type(e).__name__}: {e}")
+
 
 @app.post("/api/coach_video_v2")
 def api_coach_video_v2(req: CoachVideoRequest) -> Dict[str, Any]:
@@ -928,21 +1003,14 @@ def api_coach_video_v2(req: CoachVideoRequest) -> Dict[str, Any]:
 
 @app.post("/api/coach_video")
 def api_coach_video(
-    video: UploadFile = File(...),     # 标准视频（前端把 demoVideoSrc fetch 成文件上传）
-    text: str = Form(...),             # LLM 生成的教练反馈文本
+    video: UploadFile = File(...),
+    text: str = Form(...),
     version: str = Form("v1.5"),
     mode: str = Form("normal"),
 ) -> Dict[str, Any]:
-    """
-    1) text -> wav
-    2) video + wav -> MuseTalk
-    3) 保存 mp4 -> /generated/xxx.mp4
-    4) 返回 url
-    """
     if not text.strip():
         raise HTTPException(status_code=422, detail="text is empty")
 
-    # 生成一个唯一文件名
     uid = uuid.uuid4().hex[:10]
     out_mp4 = GENERATED_DIR / f"coach_{uid}.mp4"
 
@@ -951,14 +1019,11 @@ def api_coach_video(
         in_video = td / (video.filename or "standard.mp4")
         tts_wav = td / "tts.wav"
 
-        # 保存上传的视频
         with open(in_video, "wb") as f:
             shutil.copyfileobj(video.file, f)
 
-        # TTS -> wav
         tts_text_to_wav(text, tts_wav)
 
-        # 调 MuseTalk（加锁，避免固定槽位覆盖）
         with MUSETALK_LOCK:
             url = MUSETALK_API_BASE.rstrip("/") + "/infer"
             files = {
@@ -970,7 +1035,6 @@ def api_coach_video(
             try:
                 r = requests.post(url, data=data, files=files, timeout=1800)
             finally:
-                # 关闭文件句柄
                 for _, fp, *_ in files.values():
                     try:
                         fp.close()
@@ -980,7 +1044,6 @@ def api_coach_video(
         if r.status_code != 200:
             raise HTTPException(status_code=500, detail=f"MuseTalk failed: {r.text[:1000]}")
 
-        # 保存结果
         with open(out_mp4, "wb") as f:
             f.write(r.content)
 
@@ -989,6 +1052,7 @@ def api_coach_video(
         "url": f"/generated/{out_mp4.name}",
         "text": text,
     }
+
 
 @app.post("/api/profile/register_v2")
 async def api_profile_register_v2(
@@ -1001,7 +1065,6 @@ async def api_profile_register_v2(
         user_dir = get_user_dir(name)
         user_dir.mkdir(parents=True, exist_ok=True)
 
-        # 保存模板视频
         video_suffix = Path(video.filename or "avatar.webm").suffix or ".webm"
         raw_video_path = user_dir / f"avatar_raw{video_suffix}"
         final_video_path = get_user_avatar_path(name)
@@ -1009,7 +1072,6 @@ async def api_profile_register_v2(
         save_upload_to_path(video, raw_video_path)
         transcode_to_mp4(raw_video_path, final_video_path)
 
-        # 保存照片
         photo_suffix = Path(photo.filename or "photo.jpg").suffix or ".jpg"
         raw_photo_path = user_dir / f"photo_raw{photo_suffix}"
         final_photo_path = get_user_photo_path(name)
@@ -1053,33 +1115,55 @@ def api_profile_info(user_name: str = Query(...)):
         raise HTTPException(status_code=500, detail=f"profile info failed: {type(e).__name__}: {e}")
 
 
+# =========================
+# 标准动作视频：信息接口
+# =========================
 @app.get("/api/standard_video/info")
 def api_standard_video_info(
     user_name: str = Query(...),
     action: str = Query(...),
 ):
     try:
-        demo_video_path = get_demo_action_video_path(action)
-        generated_path = get_user_generated_standard_path(user_name, action)
+        demo_video_paths = get_demo_action_video_paths(action)
+        if not demo_video_paths:
+            raise FileNotFoundError(f"no demo videos found for action={action}")
+
+        generated_dir = get_user_standard_action_dir(user_name, action)
+        generated_items = []
+        for p in sorted(generated_dir.glob("*")):
+            if _is_video_file(p):
+                generated_items.append(build_generated_standard_item(user_name, action, p))
+
+        demo_items = []
+        for p in demo_video_paths:
+            demo_items.append({
+                "id": get_demo_action_video_id(p),
+                "file_name": p.name,
+                "demo_video_url": get_demo_action_video_public_url(action, p),
+                "demo_video_path": str(p),
+            })
+
+        # 兼容旧前端：给一个主展示视频（优先第一个生成视频，否则第一个 demo）
+        display_video_url = generated_items[0]["video_url"] if generated_items else demo_items[0]["demo_video_url"]
 
         return {
             "ok": True,
             "user_name": user_name,
             "action": action,
-            "demo_video_url": f"/demo_action/{action}.mp4",
-            "demo_video_path": str(demo_video_path),
-            "generated_exists": generated_path.exists(),
-            "display_video_url": (
-                build_public_user_standard_url(user_name, action)
-                if generated_path.exists() else None
-            ),
-            "generated_video_path": str(generated_path),
+            "demo_count": len(demo_items),
+            "generated_count": len(generated_items),
+            "demo_videos": demo_items,
+            "generated_videos": generated_items,
+            "generated_exists": len(generated_items) > 0,
+            "display_video_url": display_video_url,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"standard_video info failed: {type(e).__name__}: {e}")
-    
 
 
+# =========================
+# 标准动作视频：批量构建
+# =========================
 @app.post("/api/standard_video/build")
 def api_standard_video_build(req: BuildStandardVideoRequest):
     try:
@@ -1091,83 +1175,133 @@ def api_standard_video_build(req: BuildStandardVideoRequest):
         if not photo_path.exists():
             raise HTTPException(status_code=404, detail="user photo not found, please register first")
 
-        demo_video_path = get_demo_action_video_path(action)
-        out_path = get_user_generated_standard_path(user_name, action)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        demo_video_paths = get_demo_action_video_paths(action)
+        if not demo_video_paths:
+            raise HTTPException(status_code=404, detail=f"no demo videos found for action={action}")
 
-        if out_path.exists() and not force:
-            return {
-                "ok": True,
-                "cached": True,
-                "user_name": user_name,
-                "action": action,
-                "video_url": build_public_user_standard_url(user_name, action),
-                "local_path": str(out_path),
-            }
+        out_dir = get_user_standard_action_dir(user_name, action)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        with MUSEPOSE_LOCK:
-            with open(photo_path, "rb") as f_img, open(demo_video_path, "rb") as f_vid:
-                files = {
-                    "photo": (photo_path.name, f_img, "image/jpeg"),
-                    "pose_video": (demo_video_path.name, f_vid, "video/mp4"),
-                }
-                data = {
-                    "action": action,
-                    "width": "512",
-                    "height": "512",
-                }
-                url = f"{MUSEPOSE_API_BASE}/infer"
-                resp = requests.post(
-                    url,
-                    files=files,
-                    data=data,
-                    timeout=MUSEPOSE_TIMEOUT,
+        results = []
+        errors = []
+
+        for i, demo_video_path in enumerate(demo_video_paths, 1):
+            demo_id = get_demo_action_video_id(demo_video_path)
+            out_name = f"{i:03d}_{demo_id}.mp4"
+            out_path = get_user_generated_standard_path(user_name, action, out_name)
+
+            if out_path.exists() and not force:
+                results.append({
+                    "id": demo_id,
+                    "source_demo_video_url": get_demo_action_video_public_url(action, demo_video_path),
+                    "cached": True,
+                    **build_generated_standard_item(user_name, action, out_path),
+                })
+                continue
+
+            try:
+                content = call_musepose_with_photo_and_video(
+                    photo_path=photo_path,
+                    pose_video_path=demo_video_path,
+                    action=action,
+                    width="512",
+                    height="512",
                 )
+                with open(out_path, "wb") as f:
+                    f.write(content)
 
-        if resp.status_code != 200:
-            raise RuntimeError(f"MusePose infer failed: {resp.status_code} {resp.text[:3000]}")
-
-        with open(out_path, "wb") as f:
-            f.write(resp.content)
+                results.append({
+                    "id": demo_id,
+                    "source_demo_video_url": get_demo_action_video_public_url(action, demo_video_path),
+                    "cached": False,
+                    **build_generated_standard_item(user_name, action, out_path),
+                })
+            except Exception as e:
+                errors.append({
+                    "id": demo_id,
+                    "file_name": demo_video_path.name,
+                    "error": f"{type(e).__name__}: {e}",
+                })
 
         meta = read_user_meta(user_name)
         standard_videos = meta.get("standard_videos", {})
         standard_videos[action] = {
             "action": action,
-            "video_url": build_public_user_standard_url(user_name, action),
-            "local_path": str(out_path),
             "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "count": len(results),
+            "items": results,
+            "errors": errors,
         }
         meta["standard_videos"] = standard_videos
         meta["updated_at"] = datetime.now().isoformat(timespec="seconds")
         write_user_meta(user_name, meta)
 
         return {
-            "ok": True,
-            "cached": False,
+            "ok": len(results) > 0,
             "user_name": user_name,
             "action": action,
-            "video_url": build_public_user_standard_url(user_name, action),
-            "local_path": str(out_path),
+            "count": len(results),
+            "results": results,
+            "errors": errors,
         }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"standard_video build failed: {type(e).__name__}: {e}")
-    
 
+
+# =========================
+# 动作列表接口
+# 兼容：
+# - demo_action/*.mp4
+# - demo_action/{action}/*.mp4
+# =========================
 @app.get("/api/actions")
 def api_actions():
     try:
         if not DEMO_ACTION_DIR.exists():
             return {"ok": True, "actions": []}
 
-        actions = []
+        action_map: Dict[str, Dict[str, Any]] = {}
+
+        # 旧结构：demo_action/raise_arm.mp4
         for p in sorted(DEMO_ACTION_DIR.glob("*.mp4")):
-            actions.append({
+            action_map[p.stem] = {
                 "action": p.stem,
-                "video_url": f"/demo_action/{p.name}",
-            })
+                "video_count": 1,
+                "cover_video_url": f"/demo_action/{p.name}",
+                "videos": [
+                    {
+                        "id": p.stem,
+                        "file_name": p.name,
+                        "video_url": f"/demo_action/{p.name}",
+                    }
+                ],
+            }
+
+        # 新结构：demo_action/raise_arm/*.mp4
+        for d in sorted(DEMO_ACTION_DIR.iterdir()):
+            if not d.is_dir():
+                continue
+            vids = [p for p in sorted(d.iterdir()) if _is_video_file(p)]
+            if not vids:
+                continue
+
+            action_map[d.name] = {
+                "action": d.name,
+                "video_count": len(vids),
+                "cover_video_url": f"/demo_action/{d.name}/{vids[0].name}",
+                "videos": [
+                    {
+                        "id": p.stem,
+                        "file_name": p.name,
+                        "video_url": f"/demo_action/{d.name}/{p.name}",
+                    }
+                    for p in vids
+                ],
+            }
+
+        actions = list(action_map.values())
         return {"ok": True, "actions": actions}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"list actions failed: {type(e).__name__}: {e}")

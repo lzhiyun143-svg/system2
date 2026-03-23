@@ -27,6 +27,16 @@ type ProfileState = {
   profile?: any;
 };
 
+type StandardVideoItem = {
+  id?: string;
+  file_name?: string;
+  video_url?: string;
+  demo_video_url?: string;
+  source_demo_video_url?: string;
+  local_path?: string;
+  cached?: boolean;
+};
+
 const ACTIONS: ActionName[] = ["raise_arm"];
 
 const TARGET_DURATION_MS = 3000;
@@ -43,18 +53,14 @@ const HAND_TASK_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
 const API_BASE = "http://127.0.0.1:8000";
-const EVAL_API = "/api/evaluate";
-const LLM_PING_API = "/api/llm_ping";
-const LLM_CONFIRM_API = "/api/confirm";
+const EVAL_API = `${API_BASE}/api/evaluate`;
+const LLM_PING_API = `${API_BASE}/api/llm_ping`;
+const LLM_CONFIRM_API = `${API_BASE}/api/confirm`;
 const COACH_VIDEO_API = `${API_BASE}/api/coach_video_v2`;
 const PROFILE_CHECK_API = `${API_BASE}/api/profile/check`;
 const PROFILE_REGISTER_V2_API = `${API_BASE}/api/profile/register_v2`;
 const STANDARD_INFO_API = `${API_BASE}/api/standard_video/info`;
 const STANDARD_BUILD_API = `${API_BASE}/api/standard_video/build`;
-
-const DEMO_VIDEO_BY_ACTION: Record<ActionName, string> = {
-  raise_arm: "/demos/raise_arm.mp4",
-};
 
 function clamp01(x: number) {
   return Math.max(0, Math.min(1, x));
@@ -75,6 +81,41 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   } finally {
     window.clearTimeout(timer);
   }
+}
+
+function normalizeStandardItemsFromInfo(info: any): StandardVideoItem[] {
+  // 方案B：这里只认真正生成好的 MusePose 视频
+  if (
+    info?.generated_exists === true &&
+    Array.isArray(info?.generated_videos) &&
+    info.generated_videos.length > 0
+  ) {
+    return info.generated_videos.map((x: any, idx: number) => ({
+      id: x?.id || `${idx}`,
+      file_name: x?.file_name || `video_${idx + 1}.mp4`,
+      video_url: x?.video_url,
+      local_path: x?.local_path,
+      cached: x?.cached,
+    }));
+  }
+
+  // 不再把 display_video_url 当成生成视频
+  return [];
+}
+
+function normalizeStandardItemsFromBuild(data: any): StandardVideoItem[] {
+  if (Array.isArray(data?.results) && data.results.length > 0) {
+    return data.results.map((x: any, idx: number) => ({
+      id: x?.id || `${idx}`,
+      file_name: x?.file_name || `video_${idx + 1}.mp4`,
+      video_url: x?.video_url,
+      source_demo_video_url: x?.source_demo_video_url,
+      local_path: x?.local_path,
+      cached: x?.cached,
+    }));
+  }
+
+  return [];
 }
 
 function RehabMain({ userName }: { userName: string }) {
@@ -106,9 +147,9 @@ function RehabMain({ userName }: { userName: string }) {
 
   const [useLLM, setUseLLM] = useState<boolean>(true);
 
-  const demoVideoSrc = useMemo(() => DEMO_VIDEO_BY_ACTION[action], [action]);
+  const [stdVideoList, setStdVideoList] = useState<StandardVideoItem[]>([]);
+  const [selectedStdVideoUrl, setSelectedStdVideoUrl] = useState<string | null>(null);
 
-  const [stdOverrideSrc, setStdOverrideSrc] = useState<string | null>(null);
   const [isCoachPlaying, setIsCoachPlaying] = useState(false);
   const [buildingStandard, setBuildingStandard] = useState(false);
   const [statusText, setStatusText] = useState("");
@@ -136,6 +177,11 @@ function RehabMain({ userName }: { userName: string }) {
   const standardReadyRef = useRef<boolean>(false);
 
   const streamRef = useRef<MediaStream | null>(null);
+
+  // 方案B：只显示 MusePose 生成视频，不回退原始 demo 视频
+  const activeStandardVideoSrc = useMemo(() => {
+    return selectedStdVideoUrl || "";
+  }, [selectedStdVideoUrl]);
 
   useEffect(() => {
     let cancelled = false;
@@ -218,17 +264,40 @@ function RehabMain({ userName }: { userName: string }) {
       setStatusText("正在检查个性化标准动作视频...");
 
       const infoResp = await fetch(
-        `${STANDARD_INFO_API}?user_name=${encodeURIComponent(currentUserName)}&action=${encodeURIComponent(currentAction)}`
+        `${STANDARD_INFO_API}?user_name=${encodeURIComponent(
+          currentUserName
+        )}&action=${encodeURIComponent(currentAction)}`
       );
       const info = await infoResp.json();
 
-      if (info.generated_exists && info.display_video_url) {
-        setStdOverrideSrc(joinApiUrl(info.display_video_url));
-        setStatusText("已加载个性化标准动作视频");
-        return;
+      if (!infoResp.ok) {
+        throw new Error(info?.detail || JSON.stringify(info));
       }
 
-      setStatusText("正在生成个性化标准动作视频（MusePose）...");
+      // 这里只认真正生成好的 MusePose 视频
+      const infoItems = normalizeStandardItemsFromInfo(info);
+      if (infoItems.length > 0) {
+        const urls = infoItems
+          .map((x) => ({
+            ...x,
+            fullUrl: joinApiUrl(x.video_url || ""),
+          }))
+          .filter((x) => !!x.fullUrl);
+
+        if (urls.length > 0) {
+          setStdVideoList(
+            urls.map((x) => ({
+              ...x,
+              video_url: x.fullUrl,
+            }))
+          );
+          setSelectedStdVideoUrl(urls[0].fullUrl);
+          setStatusText(`已加载 MusePose 个性化标准动作视频（${urls.length}个）`);
+          return;
+        }
+      }
+
+      setStatusText("未找到已生成视频，正在调用 MusePose 生成...");
       const buildResp = await fetch(STANDARD_BUILD_API, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -239,18 +308,38 @@ function RehabMain({ userName }: { userName: string }) {
         }),
       });
 
+      const buildData = await buildResp.json();
       if (!buildResp.ok) {
-        const txt = await buildResp.text();
-        throw new Error(txt);
+        throw new Error(buildData?.detail || JSON.stringify(buildData));
       }
 
-      const buildData = await buildResp.json();
-      setStdOverrideSrc(joinApiUrl(buildData.video_url));
-      setStatusText("个性化标准动作视频生成完成");
+      const builtItems = normalizeStandardItemsFromBuild(buildData);
+      const urls = builtItems
+        .map((x) => ({
+          ...x,
+          fullUrl: joinApiUrl(x.video_url || ""),
+        }))
+        .filter((x) => !!x.fullUrl);
+
+      if (urls.length > 0) {
+        setStdVideoList(
+          urls.map((x) => ({
+            ...x,
+            video_url: x.fullUrl,
+          }))
+        );
+        setSelectedStdVideoUrl(urls[0].fullUrl);
+        setStatusText(`MusePose 个性化标准动作视频生成完成（${urls.length}个）`);
+      } else {
+        setStdVideoList([]);
+        setSelectedStdVideoUrl(null);
+        setStatusText("MusePose 生成完成，但未返回可播放视频");
+      }
     } catch (e: any) {
       console.error(e);
-      setStdOverrideSrc(null);
-      setStatusText(`生成失败，回退到原始标准视频：${e?.message || e}`);
+      setStdVideoList([]);
+      setSelectedStdVideoUrl(null);
+      setStatusText(`MusePose 生成失败：${e?.message || e}`);
     } finally {
       setBuildingStandard(false);
     }
@@ -297,6 +386,7 @@ function RehabMain({ userName }: { userName: string }) {
     const video = standardVideoRef.current;
     const poseLm = poseLmStdRef.current;
     if (!video || !poseLm) return;
+    if (!activeStandardVideoSrc) return;
 
     if (video.readyState < 2) {
       await new Promise<void>((resolve) => {
@@ -370,11 +460,18 @@ function RehabMain({ userName }: { userName: string }) {
 
   useEffect(() => {
     if (mpStatus !== "ready") return;
+    if (!activeStandardVideoSrc) {
+      standardReadyRef.current = false;
+      standardSeqRef.current = [];
+      stdKeyframesRef.current = [];
+      return;
+    }
+
     buildStandardSequence().catch(() => {
       standardReadyRef.current = false;
       standardSeqRef.current = [];
     });
-  }, [mpStatus, action, demoVideoSrc]);
+  }, [mpStatus, action, activeStandardVideoSrc]);
 
   async function startCamera() {
     setEvalError("");
@@ -582,6 +679,11 @@ function RehabMain({ userName }: { userName: string }) {
       return;
     }
 
+    if (!standardReadyRef.current || !standardSeqRef.current.length) {
+      setEvalError("当前还没有可用的 MusePose 标准视频骨架序列，请先等待生成完成。");
+      return;
+    }
+
     setIsEvaluating(true);
 
     try {
@@ -680,7 +782,7 @@ function RehabMain({ userName }: { userName: string }) {
       if (!resp.ok) throw new Error(data?.detail || JSON.stringify(data));
 
       const url = `${API_BASE}${data.url}?t=${Date.now()}`;
-      setStdOverrideSrc(url);
+      setSelectedStdVideoUrl(url);
 
       setTimeout(() => {
         const el = stdPlayerRef.current;
@@ -691,7 +793,6 @@ function RehabMain({ userName }: { userName: string }) {
       }, 50);
     } catch (e: any) {
       alert("生成口播失败：" + (e?.message || String(e)));
-      setStdOverrideSrc(null);
     } finally {
       setIsCoachPlaying(false);
     }
@@ -714,6 +815,11 @@ function RehabMain({ userName }: { userName: string }) {
 
     if (!result) {
       setConfirmError("请先点击 Evaluate 得到评估结果，再进行 Confirm。");
+      return;
+    }
+
+    if (!standardReadyRef.current || !stdKeyframesRef.current.length) {
+      setConfirmError("当前还没有可用的 MusePose 标准关键帧。");
       return;
     }
 
@@ -793,7 +899,7 @@ function RehabMain({ userName }: { userName: string }) {
         Rehab Web MVP (Standard ↔ User)
       </h1>
       <div style={{ opacity: 0.8, marginTop: 8 }}>
-        Camera → 3s window → {EVAL_API} → {LLM_CONFIRM_API}
+        Camera → 3s window → /api/evaluate → /api/confirm
       </div>
       <div style={{ marginTop: 10, opacity: 0.95 }}>
         当前用户：<b>{userName}</b>
@@ -838,12 +944,12 @@ function RehabMain({ userName }: { userName: string }) {
           }}
         >
           <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 10 }}>
-            Standard Demo ({action})
+            MusePose Standard Video ({action})
           </div>
 
           <video
             ref={stdPlayerRef}
-            src={stdOverrideSrc || demoVideoSrc}
+            src={activeStandardVideoSrc || undefined}
             controls
             autoPlay
             loop
@@ -854,7 +960,7 @@ function RehabMain({ userName }: { userName: string }) {
 
           <video
             ref={standardVideoRef}
-            src={demoVideoSrc}
+            src={activeStandardVideoSrc || undefined}
             muted
             playsInline
             crossOrigin="anonymous"
@@ -862,10 +968,70 @@ function RehabMain({ userName }: { userName: string }) {
             style={{ display: "none" }}
           />
 
+          {!activeStandardVideoSrc && (
+            <div style={{ marginTop: 10, color: "#ffb366" }}>
+              当前还没有 MusePose 生成视频
+            </div>
+          )}
+
           <div style={{ marginTop: 10, opacity: 0.7 }}>
-            展示视频：{stdOverrideSrc || demoVideoSrc}
-            <div style={{ marginTop: 6 }}>标准骨架：{standardReadyRef.current ? "✅ ready" : "⌛ building..."}</div>
+            当前展示视频：{activeStandardVideoSrc || "暂无"}
+            <div style={{ marginTop: 6 }}>
+              标准骨架：{standardReadyRef.current ? "✅ ready" : "⌛ building..."}
+            </div>
+            <div style={{ marginTop: 6 }}>
+              个性化视频数量：{stdVideoList.length}
+            </div>
           </div>
+
+          {stdVideoList.length > 0 && (
+            <div style={{ marginTop: 14 }}>
+              <div style={{ fontSize: 14, opacity: 0.85, marginBottom: 8 }}>
+                可切换的 MusePose 个性化标准视频
+              </div>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))",
+                  gap: 10,
+                }}
+              >
+                {stdVideoList.map((item, idx) => {
+                  const url = item.video_url || "";
+                  const active = url === activeStandardVideoSrc;
+                  return (
+                    <button
+                      key={`${item.id || idx}_${item.file_name || idx}`}
+                      onClick={() => {
+                        setSelectedStdVideoUrl(url);
+                        setStatusText(`已切换到第 ${idx + 1} 个 MusePose 标准视频`);
+                      }}
+                      style={{
+                        textAlign: "left",
+                        borderRadius: 12,
+                        padding: 10,
+                        border: active
+                          ? "1px solid #74c0fc"
+                          : "1px solid rgba(255,255,255,0.15)",
+                        background: active
+                          ? "rgba(116,192,252,0.18)"
+                          : "rgba(255,255,255,0.05)",
+                        color: "#fff",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <div style={{ fontWeight: 700, fontSize: 13 }}>
+                        {item.file_name || `video_${idx + 1}.mp4`}
+                      </div>
+                      <div style={{ marginTop: 6, opacity: 0.72, fontSize: 12 }}>
+                        {item.cached ? "cached" : "generated"}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </div>
 
         <div
@@ -929,15 +1095,35 @@ function RehabMain({ userName }: { userName: string }) {
 
             <button
               onClick={evaluate}
-              disabled={!cameraOn || !captureDoneRef.current || isEvaluating || isConfirming}
+              disabled={
+                !cameraOn ||
+                !captureDoneRef.current ||
+                isEvaluating ||
+                isConfirming ||
+                !standardReadyRef.current
+              }
               style={{
                 marginLeft: "auto",
                 padding: "10px 14px",
                 borderRadius: 12,
                 border: "1px solid rgba(255,255,255,0.25)",
-                background: !cameraOn || !captureDoneRef.current || isEvaluating || isConfirming ? "#333" : "#111",
+                background:
+                  !cameraOn ||
+                  !captureDoneRef.current ||
+                  isEvaluating ||
+                  isConfirming ||
+                  !standardReadyRef.current
+                    ? "#333"
+                    : "#111",
                 color: "#fff",
-                cursor: !cameraOn || !captureDoneRef.current || isEvaluating || isConfirming ? "not-allowed" : "pointer",
+                cursor:
+                  !cameraOn ||
+                  !captureDoneRef.current ||
+                  isEvaluating ||
+                  isConfirming ||
+                  !standardReadyRef.current
+                    ? "not-allowed"
+                    : "pointer",
               }}
             >
               {isEvaluating ? "Evaluating..." : "Evaluate (3s window)"}
@@ -960,18 +1146,35 @@ function RehabMain({ userName }: { userName: string }) {
 
             <button
               onClick={confirmLLM}
-              disabled={!cameraOn || !captureDoneRef.current || isEvaluating || isConfirming || !result}
+              disabled={
+                !cameraOn ||
+                !captureDoneRef.current ||
+                isEvaluating ||
+                isConfirming ||
+                !result ||
+                !standardReadyRef.current
+              }
               style={{
                 padding: "10px 14px",
                 borderRadius: 12,
                 border: "1px solid rgba(255,180,80,0.55)",
                 background:
-                  !cameraOn || !captureDoneRef.current || isEvaluating || isConfirming || !result
+                  !cameraOn ||
+                  !captureDoneRef.current ||
+                  isEvaluating ||
+                  isConfirming ||
+                  !result ||
+                  !standardReadyRef.current
                     ? "#333"
                     : "rgba(255,180,80,0.15)",
                 color: "#fff",
                 cursor:
-                  !cameraOn || !captureDoneRef.current || isEvaluating || isConfirming || !result
+                  !cameraOn ||
+                  !captureDoneRef.current ||
+                  isEvaluating ||
+                  isConfirming ||
+                  !result ||
+                  !standardReadyRef.current
                     ? "not-allowed"
                     : "pointer",
               }}
@@ -1036,7 +1239,17 @@ function RehabMain({ userName }: { userName: string }) {
               lineHeight: 1.4,
             }}
           >
-            {evalError ? evalError : confirmError ? confirmError : pingError ? pingError : JSON.stringify({ ping: pingResult ?? undefined, evaluate: result ?? undefined, confirm: confirmResult ?? undefined }, null, 2)}
+            {evalError
+              ? evalError
+              : confirmError
+              ? confirmError
+              : pingError
+              ? pingError
+              : JSON.stringify(
+                  { ping: pingResult ?? undefined, evaluate: result ?? undefined, confirm: confirmResult ?? undefined },
+                  null,
+                  2
+                )}
           </div>
         </div>
       </div>
