@@ -20,7 +20,6 @@ import subprocess
 import tempfile
 import shutil
 
-# OpenAI SDK（兼容 DashScope compatible-mode）
 from openai import OpenAI
 import uuid
 import threading
@@ -55,14 +54,11 @@ USER_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 DEMO_ACTION_DIR = Path(os.getenv("DEMO_ACTION_DIR", "./demo_action")).resolve()
 DEMO_ACTION_DIR.mkdir(parents=True, exist_ok=True)
 
-# ⚠️ 你现在 MuseTalk 服务是固定槽位 data/video/output.mp4 + data/audio/output.wav，不支持并发
 MUSETALK_LOCK = threading.Lock()
 
-# 安全：限制喂给 LLM 的最大 comment 数量/长度，避免 payload 过大
 MAX_RULE_COMMENTS = int(os.getenv("MAX_RULE_COMMENTS", "6"))
 MAX_COMMENT_CHARS = int(os.getenv("MAX_COMMENT_CHARS", "120"))
 
-# 图片保存路径
 COMPARE_FRAMES_DIR = Path(r"D:\system\system2_compare_frames")
 COMPARE_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -73,7 +69,7 @@ ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 # =========================
 # FastAPI
 # =========================
-app = FastAPI(title="Rehab Web Server", version="0.4.0")
+app = FastAPI(title="Rehab Web Server", version="0.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -374,8 +370,8 @@ def llm_confirm_judge_by_images(
     resp = client.chat.completions.create(
         model=DASHSCOPE_VL_MODEL,
         messages=[
-            {"role": "system", "content": "Return valid JSON only."},
-            {"role": "user", "content": content_items},
+          {"role": "system", "content": "Return valid JSON only."},
+          {"role": "user", "content": content_items},
         ],
         temperature=0.1,
         max_tokens=512,
@@ -475,9 +471,6 @@ def save_json_file(path: Path, data: Dict[str, Any]):
         print(f"[save_json_file] failed: {e}")
 
 
-# =========================
-# User / path helpers
-# =========================
 def normalize_user_name(name: str) -> str:
     name = (name or "").strip()
     if not name:
@@ -600,21 +593,11 @@ def build_user_profile(name: str) -> Dict[str, Any]:
     }
 
 
-# =========================
-# Demo action video helpers
-# 兼容两种目录结构：
-# 1) 旧版：demo_action/raise_arm.mp4
-# 2) 新版：demo_action/raise_arm/*.mp4
-# =========================
 def _is_video_file(p: Path) -> bool:
     return p.is_file() and p.suffix.lower() in ALLOWED_VIDEO_EXTS
 
 
 def get_demo_action_video_path(action: str) -> Path:
-    """
-    旧接口兼容：优先取 demo_action/{action}.mp4，
-    如果没有，则取 demo_action/{action}/ 下的第一个视频。
-    """
     flat = DEMO_ACTION_DIR / f"{action}.mp4"
     if flat.exists():
         return flat
@@ -629,12 +612,6 @@ def get_demo_action_video_path(action: str) -> Path:
 
 
 def get_demo_action_video_paths(action: str) -> List[Path]:
-    """
-    新接口：返回某个动作下的所有标准视频。
-    兼容：
-    - demo_action/{action}.mp4
-    - demo_action/{action}/*.mp4
-    """
     out: List[Path] = []
 
     flat = DEMO_ACTION_DIR / f"{action}.mp4"
@@ -647,7 +624,6 @@ def get_demo_action_video_paths(action: str) -> List[Path]:
             if _is_video_file(p):
                 out.append(p)
 
-    # 去重
     uniq = []
     seen = set()
     for p in out:
@@ -750,6 +726,149 @@ class BuildStandardVideoRequest(BaseModel):
     force: Optional[bool] = False
 
 
+class EvaluateAutoRequest(BaseModel):
+    action: str
+    user_name: str
+    frames: Optional[List[FrameIn]] = None
+    user_seq: Optional[List[FrameIn]] = None
+    standard_seq: Optional[List[FrameIn]] = None
+    standard_images: Optional[List[str]] = None
+    user_images: Optional[List[str]] = None
+    use_llm: Optional[bool] = True
+
+
+# =========================
+# Helper for evaluate_auto
+# =========================
+def build_coach_script(confirm_out: Dict[str, Any], eval_out: Optional[Dict[str, Any]] = None) -> str:
+    overall = str((confirm_out or {}).get("overall") or "").strip()
+    key_issues = (confirm_out or {}).get("key_issues") or []
+    tips = (confirm_out or {}).get("tips") or []
+
+    if not overall and eval_out:
+        overall = str(eval_out.get("llm_feedback") or "").strip()
+
+    lines: List[str] = []
+
+    if overall:
+        lines.append(f"本次动作评估结果：{overall}")
+
+    if key_issues:
+        clean_issues = [str(x).strip() for x in key_issues if str(x).strip()]
+        if clean_issues:
+            lines.append("主要问题有：" + "；".join(clean_issues[:3]) + "。")
+
+    if tips:
+        clean_tips = [str(x).strip() for x in tips if str(x).strip()]
+        if clean_tips:
+            lines.append("建议你这样调整：" + "；".join(clean_tips[:3]) + "。")
+
+    if not lines:
+        lines.append("本次动作已完成评估。请继续保持动作稳定，注意幅度和节奏一致。")
+
+    return "\n".join(lines)
+
+
+def generate_musetalk_feedback_video(
+    user_name: str,
+    text: str,
+    version: str = "v1.5",
+    mode: str = "normal",
+) -> str:
+    if not text.strip():
+        raise RuntimeError("feedback text is empty")
+
+    video_path = get_user_video_path(user_name)
+    if not video_path.exists():
+        raise RuntimeError("user template video not found, please register first")
+
+    uid = uuid.uuid4().hex[:10]
+    safe_name = normalize_user_name(user_name)
+    out_mp4 = GENERATED_DIR / f"coach_{safe_name}_{uid}.mp4"
+
+    with tempfile.TemporaryDirectory(prefix="coach_video_") as td:
+        td = Path(td)
+        tts_wav = td / "tts.wav"
+
+        tts_text_to_wav(text, tts_wav)
+
+        with MUSETALK_LOCK:
+            url = MUSETALK_API_BASE.rstrip("/") + "/infer"
+            video_fp = open(video_path, "rb")
+            audio_fp = open(tts_wav, "rb")
+            files = {
+                "video": (video_path.name, video_fp, "video/mp4"),
+                "audio": (tts_wav.name, audio_fp, "audio/wav"),
+            }
+            data = {"version": version, "mode": mode}
+            try:
+                r = requests.post(url, data=data, files=files, timeout=1800)
+            finally:
+                try:
+                    video_fp.close()
+                except Exception:
+                    pass
+                try:
+                    audio_fp.close()
+                except Exception:
+                    pass
+
+        if r.status_code != 200:
+            raise RuntimeError(f"MuseTalk failed: {r.text[:1000]}")
+
+        with open(out_mp4, "wb") as f:
+            f.write(r.content)
+
+    return f"/generated/{out_mp4.name}"
+
+
+def run_evaluate_core(req: EvalRequest) -> Dict[str, Any]:
+    user_in = req.frames if req.frames is not None else req.user_seq
+    if not user_in:
+        raise HTTPException(status_code=422, detail="Field required: frames or user_seq")
+
+    user_frames = [
+        Frame(pose=f.pose, left_hand=f.left_hand, right_hand=f.right_hand)
+        for f in user_in
+        if f.pose is not None
+    ]
+
+    std_frames = None
+    if req.standard_seq:
+        std_frames = [
+            Frame(pose=f.pose, left_hand=f.left_hand, right_hand=f.right_hand)
+            for f in req.standard_seq
+            if f.pose is not None
+        ]
+
+    if len(user_frames) < 3:
+        raise HTTPException(status_code=400, detail="Too few valid frames (<3).")
+
+    out = evaluator.evaluate(
+        action=req.action,
+        user_frames=user_frames,
+        standard_frames=std_frames,
+    )
+
+    out["_meta"] = {
+        "user_frames": len(user_frames),
+        "standard_frames": len(std_frames) if std_frames is not None else 0,
+        "use_standard": bool(std_frames),
+        "use_llm_feedback": bool(req.use_llm),
+    }
+
+    if req.use_llm:
+        try:
+            out["llm_feedback"] = llm_action_feedback(req.action, out)
+            out["llm_used"] = True
+            out["llm_model"] = DASHSCOPE_MODEL
+        except Exception as e:
+            out["llm_used"] = False
+            out["llm_error"] = f"{type(e).__name__}: {e}"
+
+    return out
+
+
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True}
@@ -806,9 +925,6 @@ async def api_profile_register(
         raise HTTPException(status_code=500, detail=f"profile register failed: {type(e).__name__}: {e}")
 
 
-# =========================
-# LLM connectivity endpoints
-# =========================
 @app.get("/api/llm_ping")
 def api_llm_ping() -> Dict[str, Any]:
     try:
@@ -887,59 +1003,98 @@ def api_confirm_post(req: ConfirmRequest) -> Dict[str, Any]:
         )
 
 
-# =========================
-# Main evaluate endpoint
-# =========================
 @app.post("/api/evaluate")
 def api_evaluate(req: EvalRequest) -> Dict[str, Any]:
-    user_in = req.frames if req.frames is not None else req.user_seq
-    if not user_in:
-        raise HTTPException(status_code=422, detail="Field required: frames or user_seq")
-
-    user_frames = [
-        Frame(pose=f.pose, left_hand=f.left_hand, right_hand=f.right_hand)
-        for f in user_in
-        if f.pose is not None
-    ]
-
-    std_frames = None
-    if req.standard_seq:
-        std_frames = [
-            Frame(pose=f.pose, left_hand=f.left_hand, right_hand=f.right_hand)
-            for f in req.standard_seq
-            if f.pose is not None
-        ]
-
-    if len(user_frames) < 3:
-        raise HTTPException(status_code=400, detail="Too few valid frames (<3).")
-
     try:
-        out = evaluator.evaluate(
-            action=req.action,
-            user_frames=user_frames,
-            standard_frames=std_frames,
-        )
-
-        out["_meta"] = {
-            "user_frames": len(user_frames),
-            "standard_frames": len(std_frames) if std_frames is not None else 0,
-            "use_standard": bool(std_frames),
-            "use_llm_feedback": bool(req.use_llm),
-        }
-
-        if req.use_llm:
-            try:
-                out["llm_feedback"] = llm_action_feedback(req.action, out)
-                out["llm_used"] = True
-                out["llm_model"] = DASHSCOPE_MODEL
-            except Exception as e:
-                out["llm_used"] = False
-                out["llm_error"] = f"{type(e).__name__}: {e}"
-
-        return out
-
+        return run_evaluate_core(req)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {type(e).__name__}: {e}")
+
+
+@app.post("/api/evaluate_auto")
+def api_evaluate_auto(req: EvaluateAutoRequest) -> Dict[str, Any]:
+    try:
+        eval_req = EvalRequest(
+            action=req.action,
+            frames=req.frames,
+            user_seq=req.user_seq,
+            standard_seq=req.standard_seq,
+            use_llm=req.use_llm,
+        )
+        eval_out = run_evaluate_core(eval_req)
+
+        confirm_out: Dict[str, Any]
+        save_info: Optional[Dict[str, Any]] = None
+
+        std_imgs = (req.standard_images or [])[:6]
+        usr_imgs = (req.user_images or [])[:6]
+
+        if req.use_llm and len(std_imgs) >= 2 and len(usr_imgs) >= 2:
+            save_info = save_compare_keyframes(
+                action=req.action,
+                standard_images=std_imgs,
+                user_images=usr_imgs,
+            )
+
+            confirm_out = llm_confirm_judge_by_images(
+                action=req.action,
+                standard_images=std_imgs,
+                user_images=usr_imgs,
+                eval_result=eval_out,
+            )
+
+            try:
+                save_json_file(Path(save_info["session_dir"]) / "llm_result.json", confirm_out)
+            except Exception:
+                pass
+        elif req.use_llm:
+            confirm_out = llm_confirm_judge(req.action, eval_out)
+        else:
+            confirm_out = {
+                "is_pass": None,
+                "confidence": 0.0,
+                "overall": "已完成动作评估。",
+                "key_issues": eval_out.get("rule_based_comments", [])[:3],
+                "tips": eval_out.get("rule_based_comments", [])[:3],
+                "mode": "rule_only",
+            }
+
+        feedback_text = build_coach_script(confirm_out, eval_out)
+
+        coach_video_url = ""
+        coach_video_error = ""
+        try:
+            coach_video_url = generate_musetalk_feedback_video(
+                user_name=req.user_name,
+                text=feedback_text,
+                version="v1.5",
+                mode="normal",
+            )
+        except Exception as e:
+            coach_video_error = f"{type(e).__name__}: {e}"
+
+        return {
+            "ok": True,
+            "action": req.action,
+            "user_name": req.user_name,
+            "evaluate": eval_out,
+            "confirm": confirm_out,
+            "feedback_text": feedback_text,
+            "coach_video_url": coach_video_url,
+            "coach_video_error": coach_video_error,
+            "saved_frames": {
+                "session_dir": save_info["session_dir"],
+                "saved_standard_count": save_info["saved_standard_count"],
+                "saved_user_count": save_info["saved_user_count"],
+            } if save_info else None,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"evaluate_auto failed: {type(e).__name__}: {e}")
 
 
 @app.post("/api/coach_video_v2")
@@ -948,57 +1103,21 @@ def api_coach_video_v2(req: CoachVideoRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=422, detail="text is empty")
 
     try:
-        video_path = get_user_video_path(req.user_name)
+        url = generate_musetalk_feedback_video(
+            user_name=req.user_name,
+            text=req.text,
+            version=req.version or "v1.5",
+            mode=req.mode or "normal",
+        )
+        return {
+            "ok": True,
+            "url": url,
+            "text": req.text,
+            "user_name": req.user_name,
+            "template_video": str(get_user_video_path(req.user_name)),
+        }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"invalid user name: {e}")
-
-    if not video_path.exists():
-        raise HTTPException(status_code=404, detail="user template video not found, please register first")
-
-    uid = uuid.uuid4().hex[:10]
-    safe_name = normalize_user_name(req.user_name)
-    out_mp4 = GENERATED_DIR / f"coach_{safe_name}_{uid}.mp4"
-
-    with tempfile.TemporaryDirectory(prefix="coach_video_") as td:
-        td = Path(td)
-        tts_wav = td / "tts.wav"
-
-        tts_text_to_wav(req.text, tts_wav)
-
-        with MUSETALK_LOCK:
-            url = MUSETALK_API_BASE.rstrip("/") + "/infer"
-            video_fp = open(video_path, "rb")
-            audio_fp = open(tts_wav, "rb")
-            files = {
-                "video": (video_path.name, video_fp, "video/mp4"),
-                "audio": (tts_wav.name, audio_fp, "audio/wav"),
-            }
-            data = {"version": req.version or "v1.5", "mode": req.mode or "normal"}
-            try:
-                r = requests.post(url, data=data, files=files, timeout=1800)
-            finally:
-                try:
-                    video_fp.close()
-                except Exception:
-                    pass
-                try:
-                    audio_fp.close()
-                except Exception:
-                    pass
-
-        if r.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"MuseTalk failed: {r.text[:1000]}")
-
-        with open(out_mp4, "wb") as f:
-            f.write(r.content)
-
-    return {
-        "ok": True,
-        "url": f"/generated/{out_mp4.name}",
-        "text": req.text,
-        "user_name": req.user_name,
-        "template_video": str(video_path),
-    }
+        raise HTTPException(status_code=500, detail=f"coach_video_v2 failed: {type(e).__name__}: {e}")
 
 
 @app.post("/api/coach_video")
@@ -1115,9 +1234,6 @@ def api_profile_info(user_name: str = Query(...)):
         raise HTTPException(status_code=500, detail=f"profile info failed: {type(e).__name__}: {e}")
 
 
-# =========================
-# 标准动作视频：信息接口
-# =========================
 @app.get("/api/standard_video/info")
 def api_standard_video_info(
     user_name: str = Query(...),
@@ -1143,7 +1259,6 @@ def api_standard_video_info(
                 "demo_video_path": str(p),
             })
 
-        # 兼容旧前端：给一个主展示视频（优先第一个生成视频，否则第一个 demo）
         display_video_url = generated_items[0]["video_url"] if generated_items else demo_items[0]["demo_video_url"]
 
         return {
@@ -1161,9 +1276,6 @@ def api_standard_video_info(
         raise HTTPException(status_code=500, detail=f"standard_video info failed: {type(e).__name__}: {e}")
 
 
-# =========================
-# 标准动作视频：批量构建
-# =========================
 @app.post("/api/standard_video/build")
 def api_standard_video_build(req: BuildStandardVideoRequest):
     try:
@@ -1250,12 +1362,6 @@ def api_standard_video_build(req: BuildStandardVideoRequest):
         raise HTTPException(status_code=500, detail=f"standard_video build failed: {type(e).__name__}: {e}")
 
 
-# =========================
-# 动作列表接口
-# 兼容：
-# - demo_action/*.mp4
-# - demo_action/{action}/*.mp4
-# =========================
 @app.get("/api/actions")
 def api_actions():
     try:
@@ -1264,7 +1370,6 @@ def api_actions():
 
         action_map: Dict[str, Dict[str, Any]] = {}
 
-        # 旧结构：demo_action/raise_arm.mp4
         for p in sorted(DEMO_ACTION_DIR.glob("*.mp4")):
             action_map[p.stem] = {
                 "action": p.stem,
@@ -1279,7 +1384,6 @@ def api_actions():
                 ],
             }
 
-        # 新结构：demo_action/raise_arm/*.mp4
         for d in sorted(DEMO_ACTION_DIR.iterdir()):
             if not d.is_dir():
                 continue

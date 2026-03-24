@@ -14,7 +14,7 @@ type FramePayload = {
   right_hand: number[][];
 };
 
-type EvalResponse = any;
+type EvalAutoResponse = any;
 
 type ProfileState = {
   ok?: boolean;
@@ -37,12 +37,11 @@ type StandardVideoItem = {
   cached?: boolean;
 };
 
-const ACTIONS: ActionName[] = ["raise_arm"];
+const FIXED_ACTION: ActionName = "raise_arm";
 
-const TARGET_DURATION_MS = 3000;
+const DEFAULT_TARGET_DURATION_MS = 3000;
 const SAMPLE_INTERVAL_MS = 33;
-const EVAL_TIMEOUT_MS = 12_000;
-const LLM_TIMEOUT_MS = 20_000;
+const EVAL_TIMEOUT_MS = 120_000;
 
 const MP_WASM_BASE =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm";
@@ -53,10 +52,7 @@ const HAND_TASK_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
 const API_BASE = "http://127.0.0.1:8000";
-const EVAL_API = `${API_BASE}/api/evaluate`;
-const LLM_PING_API = `${API_BASE}/api/llm_ping`;
-const LLM_CONFIRM_API = `${API_BASE}/api/confirm`;
-const COACH_VIDEO_API = `${API_BASE}/api/coach_video_v2`;
+const EVAL_AUTO_API = `${API_BASE}/api/evaluate_auto`;
 const PROFILE_CHECK_API = `${API_BASE}/api/profile/check`;
 const PROFILE_REGISTER_V2_API = `${API_BASE}/api/profile/register_v2`;
 const STANDARD_INFO_API = `${API_BASE}/api/standard_video/info`;
@@ -84,7 +80,6 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 }
 
 function normalizeStandardItemsFromInfo(info: any): StandardVideoItem[] {
-  // 方案B：这里只认真正生成好的 MusePose 视频
   if (
     info?.generated_exists === true &&
     Array.isArray(info?.generated_videos) &&
@@ -98,8 +93,6 @@ function normalizeStandardItemsFromInfo(info: any): StandardVideoItem[] {
       cached: x?.cached,
     }));
   }
-
-  // 不再把 display_video_url 当成生成视频
   return [];
 }
 
@@ -114,12 +107,23 @@ function normalizeStandardItemsFromBuild(data: any): StandardVideoItem[] {
       cached: x?.cached,
     }));
   }
-
   return [];
 }
 
+function getKeyframeTargets(totalMs: number) {
+  const count = Math.max(5, Math.min(16, Math.ceil(totalMs / 800)));
+  if (count <= 1) return [0];
+
+  const targets: number[] = [];
+  for (let i = 0; i < count; i++) {
+    const ratio = (0.95 * i) / (count - 1);
+    targets.push(ratio * totalMs);
+  }
+  return targets;
+}
+
 function RehabMain({ userName }: { userName: string }) {
-  const [action, setAction] = useState<ActionName>("raise_arm");
+  const action: ActionName = FIXED_ACTION;
 
   const [mpStatus, setMpStatus] = useState<"idle" | "loading" | "ready" | "error">(
     "idle"
@@ -132,34 +136,33 @@ function RehabMain({ userName }: { userName: string }) {
 
   const [framesBuffered, setFramesBuffered] = useState(0);
   const [isEvaluating, setIsEvaluating] = useState(false);
-  const poseLmStdRef = useRef<PoseLandmarker | null>(null);
 
-  const [isPinging, setIsPinging] = useState(false);
-  const [pingResult, setPingResult] = useState<any | null>(null);
-  const [pingError, setPingError] = useState<string>("");
-
-  const [isConfirming, setIsConfirming] = useState(false);
-  const [confirmResult, setConfirmResult] = useState<any | null>(null);
-  const [confirmError, setConfirmError] = useState<string>("");
-
-  const [result, setResult] = useState<EvalResponse | null>(null);
+  const [result, setResult] = useState<EvalAutoResponse | null>(null);
   const [evalError, setEvalError] = useState<string>("");
 
-  const [useLLM, setUseLLM] = useState<boolean>(true);
+  const [feedbackText, setFeedbackText] = useState<string>("");
+  const [coachVideoUrl, setCoachVideoUrl] = useState<string>("");
 
   const [stdVideoList, setStdVideoList] = useState<StandardVideoItem[]>([]);
   const [selectedStdVideoUrl, setSelectedStdVideoUrl] = useState<string | null>(null);
 
-  const [isCoachPlaying, setIsCoachPlaying] = useState(false);
   const [buildingStandard, setBuildingStandard] = useState(false);
   const [statusText, setStatusText] = useState("");
+
+  const [currentTrainDurationMs, setCurrentTrainDurationMs] = useState<number>(
+    DEFAULT_TARGET_DURATION_MS
+  );
+  const [trainFinished, setTrainFinished] = useState<boolean>(false);
+  const [trainHint, setTrainHint] = useState<string>("");
 
   const userVideoRef = useRef<HTMLVideoElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
   const standardVideoRef = useRef<HTMLVideoElement | null>(null);
   const stdPlayerRef = useRef<HTMLVideoElement | null>(null);
+  const coachPlayerRef = useRef<HTMLVideoElement | null>(null);
 
   const poseLmRef = useRef<PoseLandmarker | null>(null);
+  const poseLmStdRef = useRef<PoseLandmarker | null>(null);
   const handLmRef = useRef<HandLandmarker | null>(null);
   const drawingRef = useRef<DrawingUtils | null>(null);
 
@@ -178,7 +181,6 @@ function RehabMain({ userName }: { userName: string }) {
 
   const streamRef = useRef<MediaStream | null>(null);
 
-  // 方案B：只显示 MusePose 生成视频，不回退原始 demo 视频
   const activeStandardVideoSrc = useMemo(() => {
     return selectedStdVideoUrl || "";
   }, [selectedStdVideoUrl]);
@@ -274,7 +276,6 @@ function RehabMain({ userName }: { userName: string }) {
         throw new Error(info?.detail || JSON.stringify(info));
       }
 
-      // 这里只认真正生成好的 MusePose 视频
       const infoItems = normalizeStandardItemsFromInfo(info);
       if (infoItems.length > 0) {
         const urls = infoItems
@@ -374,10 +375,6 @@ function RehabMain({ userName }: { userName: string }) {
     return canvas.toDataURL("image/jpeg", quality);
   }
 
-  function getKeyframeTargets(totalMs: number) {
-    return [0, 0.25, 0.5, 0.75, 0.95].map((r) => r * totalMs);
-  }
-
   async function buildStandardSequence() {
     standardReadyRef.current = false;
     standardSeqRef.current = [];
@@ -410,7 +407,8 @@ function RehabMain({ userName }: { userName: string }) {
     }
 
     const videoDurationMs = (video.duration || 3) * 1000;
-    const durMs = Math.min(TARGET_DURATION_MS, videoDurationMs);
+    const durMs = Math.max(1000, Math.round(videoDurationMs));
+    setCurrentTrainDurationMs(durMs);
 
     const seq: FramePayload[] = [];
     const baseTs = performance.now();
@@ -476,8 +474,10 @@ function RehabMain({ userName }: { userName: string }) {
   async function startCamera() {
     setEvalError("");
     setResult(null);
-    setConfirmResult(null);
-    setConfirmError("");
+    setFeedbackText("");
+    setCoachVideoUrl("");
+    setTrainFinished(false);
+    setTrainHint("");
 
     const video = userVideoRef.current;
     if (!video) return;
@@ -499,6 +499,17 @@ function RehabMain({ userName }: { userName: string }) {
       captureDoneRef.current = false;
       userKeyframesRef.current = [];
 
+      const stdPlayer = stdPlayerRef.current;
+      if (stdPlayer && activeStandardVideoSrc) {
+        try {
+          stdPlayer.pause();
+          stdPlayer.currentTime = 0;
+          await stdPlayer.play();
+        } catch (e) {
+          console.warn("标准视频播放失败：", e);
+        }
+      }
+
       startLoop();
     } catch (e: any) {
       setEvalError("无法打开摄像头：" + String(e?.message || e));
@@ -515,6 +526,7 @@ function RehabMain({ userName }: { userName: string }) {
     lastSampleTsRef.current = 0;
     captureStartTsRef.current = null;
     captureDoneRef.current = false;
+    userKeyframesRef.current = [];
 
     if (rafRef.current != null) {
       cancelAnimationFrame(rafRef.current);
@@ -525,6 +537,13 @@ function RehabMain({ userName }: { userName: string }) {
     if (stream) {
       stream.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
+    }
+
+    const stdPlayer = stdPlayerRef.current;
+    if (stdPlayer) {
+      try {
+        stdPlayer.pause();
+      } catch {}
     }
   }
 
@@ -595,26 +614,16 @@ function RehabMain({ userName }: { userName: string }) {
 
         if (stdPose && stdPose.length === 33) {
           const stdLandmarks = stdPose.map(([x, y]) => ({ x: 1 - x, y, z: 0 }));
-          drawer.drawLandmarks(stdLandmarks as any, { radius: 3, color: "#00ff66" } as any);
+          drawer.drawLandmarks(stdLandmarks as any, {
+            radius: 3,
+            color: "#00ff66",
+          } as any);
           drawer.drawConnectors(
             stdLandmarks as any,
             PoseLandmarker.POSE_CONNECTIONS,
             { color: "#00ff66", lineWidth: 2 } as any
           );
         }
-      }
-
-      if (posePts) {
-        drawer.drawLandmarks(posePts, { radius: 3 } as any);
-        drawer.drawConnectors(posePts, PoseLandmarker.POSE_CONNECTIONS);
-      }
-      if (leftHand) {
-        drawer.drawLandmarks(leftHand, { radius: 3 } as any);
-        drawer.drawConnectors(leftHand, HandLandmarker.HAND_CONNECTIONS);
-      }
-      if (rightHand) {
-        drawer.drawLandmarks(rightHand, { radius: 3 } as any);
-        drawer.drawConnectors(rightHand, HandLandmarker.HAND_CONNECTIONS);
       }
 
       ctx.restore();
@@ -627,7 +636,7 @@ function RehabMain({ userName }: { userName: string }) {
       }
 
       const elapsed = ts - captureStartTsRef.current;
-      if (elapsed >= TARGET_DURATION_MS) {
+      if (elapsed >= currentTrainDurationMs) {
         captureDoneRef.current = true;
         return;
       }
@@ -635,7 +644,7 @@ function RehabMain({ userName }: { userName: string }) {
       if (ts - lastSampleTsRef.current < SAMPLE_INTERVAL_MS) return;
       lastSampleTsRef.current = ts;
 
-      const keyTargets = getKeyframeTargets(TARGET_DURATION_MS);
+      const keyTargets = getKeyframeTargets(currentTrainDurationMs);
       if (userKeyframesRef.current.length < keyTargets.length) {
         const nextTarget = keyTargets[userKeyframesRef.current.length];
         if (elapsed >= nextTarget) {
@@ -660,16 +669,18 @@ function RehabMain({ userName }: { userName: string }) {
     rafRef.current = requestAnimationFrame(step);
   }
 
-  async function evaluate() {
+  async function evaluateAuto() {
     setEvalError("");
     setResult(null);
-    setConfirmResult(null);
-    setConfirmError("");
+    setFeedbackText("");
+    setCoachVideoUrl("");
 
     if (isEvaluating) return;
 
     if (!captureDoneRef.current) {
-      setEvalError(`还没采集满 ${TARGET_DURATION_MS / 1000}s，请继续保持动作...`);
+      setEvalError(
+        `当前训练尚未完成，请先跟随左侧视频训练完毕（约 ${(currentTrainDurationMs / 1000).toFixed(1)} 秒）`
+      );
       return;
     }
 
@@ -684,19 +695,35 @@ function RehabMain({ userName }: { userName: string }) {
       return;
     }
 
+    const stdImgs = stdKeyframesRef.current || [];
+    const usrImgs = userKeyframesRef.current || [];
+
+    if (stdImgs.length < 2) {
+      setEvalError(`标准关键帧不足：${stdImgs.length}（至少需要 2 张）`);
+      return;
+    }
+    if (usrImgs.length < 2) {
+      setEvalError(`用户关键帧不足：${usrImgs.length}（至少需要 2 张）`);
+      return;
+    }
+
     setIsEvaluating(true);
+    setStatusText("正在评估动作并生成文字 / 视频反馈...");
 
     try {
       const payload: any = {
         action,
+        user_name: userName,
         frames,
         user_seq: frames,
-        standard_seq: standardReadyRef.current ? standardSeqRef.current : null,
-        use_llm: useLLM,
+        standard_seq: standardSeqRef.current,
+        standard_images: stdImgs,
+        user_images: usrImgs,
+        use_llm: true,
       };
 
       const resp = await fetchWithTimeout(
-        EVAL_API,
+        EVAL_AUTO_API,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -711,177 +738,35 @@ function RehabMain({ userName }: { userName: string }) {
         return;
       }
 
+      let parsed: any = null;
       try {
-        setResult(JSON.parse(text));
+        parsed = JSON.parse(text);
       } catch {
-        setResult({ raw: text });
+        parsed = { raw: text };
       }
+
+      setResult(parsed);
+      setFeedbackText(parsed?.feedback_text || "");
+      setCoachVideoUrl(joinApiUrl(parsed?.coach_video_url || ""));
+
+      setStatusText("评估完成");
+      setTimeout(() => {
+        const el = coachPlayerRef.current;
+        if (el && parsed?.coach_video_url) {
+          el.currentTime = 0;
+          el.play().catch(() => {});
+        }
+      }, 80);
     } catch (e: any) {
       if (e?.name === "AbortError") {
         setEvalError(
-          `请求超时（${EVAL_TIMEOUT_MS}ms）\n请确认后端 http://127.0.0.1:8000 正在运行，并且 /api/evaluate 没卡住。`
+          `请求超时（${EVAL_TIMEOUT_MS}ms）\n请确认后端 http://127.0.0.1:8000 正在运行，并且 /api/evaluate_auto 没卡住。`
         );
       } else {
         setEvalError("请求失败：" + String(e?.message || e));
       }
     } finally {
       setIsEvaluating(false);
-    }
-  }
-
-  async function pingLLM() {
-    setPingError("");
-    setPingResult(null);
-    if (isPinging) return;
-    setIsPinging(true);
-
-    try {
-      const resp = await fetchWithTimeout(LLM_PING_API, { method: "GET" }, 8_000);
-      const text = await resp.text();
-      if (!resp.ok) {
-        setPingError(`HTTP ${resp.status}:\n${text}`);
-        return;
-      }
-      try {
-        setPingResult(JSON.parse(text));
-      } catch {
-        setPingResult({ raw: text });
-      }
-    } catch (e: any) {
-      setPingError("Ping 失败：" + String(e?.message || e));
-    } finally {
-      setIsPinging(false);
-    }
-  }
-
-  async function playCoachVideoFromLLM() {
-    const feedbackText =
-      (result as any)?.llm_feedback ||
-      (confirmResult as any)?.llm_confirm?.overall ||
-      "";
-
-    if (!feedbackText.trim()) {
-      alert("没有可用的教练反馈文本（请先勾选用大模型生成教练反馈，并 Evaluate 一次）");
-      return;
-    }
-
-    setIsCoachPlaying(true);
-
-    try {
-      const resp = await fetch(COACH_VIDEO_API, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          user_name: userName,
-          text: feedbackText,
-          version: "v1.5",
-          mode: "normal",
-        }),
-      });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data?.detail || JSON.stringify(data));
-
-      const url = `${API_BASE}${data.url}?t=${Date.now()}`;
-      setSelectedStdVideoUrl(url);
-
-      setTimeout(() => {
-        const el = stdPlayerRef.current;
-        if (el) {
-          el.currentTime = 0;
-          el.play().catch(() => {});
-        }
-      }, 50);
-    } catch (e: any) {
-      alert("生成口播失败：" + (e?.message || String(e)));
-    } finally {
-      setIsCoachPlaying(false);
-    }
-  }
-
-  async function confirmLLM() {
-    setConfirmError("");
-    setConfirmResult(null);
-
-    if (!captureDoneRef.current) {
-      setConfirmError(`还没采集满 ${TARGET_DURATION_MS / 1000}s，请继续保持动作...`);
-      return;
-    }
-
-    const frames = framesRef.current;
-    if (frames.length < 3) {
-      setConfirmError(`有效帧过少：${frames.length}（至少需要 3 帧）`);
-      return;
-    }
-
-    if (!result) {
-      setConfirmError("请先点击 Evaluate 得到评估结果，再进行 Confirm。");
-      return;
-    }
-
-    if (!standardReadyRef.current || !stdKeyframesRef.current.length) {
-      setConfirmError("当前还没有可用的 MusePose 标准关键帧。");
-      return;
-    }
-
-    if (isConfirming) return;
-
-    const stdImgs = stdKeyframesRef.current || [];
-    const usrImgs = userKeyframesRef.current || [];
-
-    if (stdImgs.length < 2) {
-      setConfirmError(`标准关键帧不足：${stdImgs.length}（至少需要 2 张，建议 5 张）`);
-      return;
-    }
-    if (usrImgs.length < 2) {
-      setConfirmError(`用户关键帧不足：${usrImgs.length}（至少需要 2 张，建议 5 张）`);
-      return;
-    }
-
-    const ok = window.confirm("将调用大模型进行关键帧对比确认（可能产生费用），是否继续？");
-    if (!ok) return;
-
-    setIsConfirming(true);
-
-    try {
-      const payload = {
-        action,
-        frames,
-        standard_seq: standardReadyRef.current ? standardSeqRef.current : null,
-        eval_result: result,
-        standard_images: stdImgs,
-        user_images: usrImgs,
-      };
-
-      const resp = await fetchWithTimeout(
-        LLM_CONFIRM_API,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        },
-        LLM_TIMEOUT_MS
-      );
-
-      const text = await resp.text();
-      if (!resp.ok) {
-        setConfirmError(`HTTP ${resp.status}:\n${text}`);
-        return;
-      }
-
-      try {
-        const parsed = JSON.parse(text);
-        setConfirmResult(parsed);
-      } catch {
-        setConfirmResult({ raw: text });
-      }
-    } catch (e: any) {
-      if (e?.name === "AbortError") {
-        setConfirmError(`Confirm 超时（${LLM_TIMEOUT_MS}ms）。`);
-      } else {
-        setConfirmError("Confirm 失败：" + String(e?.message || e));
-      }
-    } finally {
-      setIsConfirming(false);
     }
   }
 
@@ -895,11 +780,9 @@ function RehabMain({ userName }: { userName: string }) {
         fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial",
       }}
     >
-      <h1 style={{ fontSize: 44, margin: 0, lineHeight: 1.1 }}>
-        Rehab Web MVP (Standard ↔ User)
-      </h1>
+      <h1 style={{ fontSize: 44, margin: 0, lineHeight: 1.1 }}>康复训练系统</h1>
       <div style={{ opacity: 0.8, marginTop: 8 }}>
-        Camera → 3s window → /api/evaluate → /api/confirm
+        摄像头采集 → 训练视频同步跟练 → 自动评估 → 文字反馈 + 数字人口播反馈
       </div>
       <div style={{ marginTop: 10, opacity: 0.95 }}>
         当前用户：<b>{userName}</b>
@@ -951,10 +834,19 @@ function RehabMain({ userName }: { userName: string }) {
             ref={stdPlayerRef}
             src={activeStandardVideoSrc || undefined}
             controls
-            autoPlay
-            loop
             muted
             playsInline
+            onLoadedMetadata={(e) => {
+              const el = e.currentTarget;
+              const durSec = el.duration && Number.isFinite(el.duration) ? el.duration : 3;
+              const durMs = Math.max(1000, Math.round(durSec * 1000));
+              setCurrentTrainDurationMs(durMs);
+            }}
+            onEnded={() => {
+              setTrainFinished(true);
+              setTrainHint("该视频训练结束，请点击评价");
+              captureDoneRef.current = true;
+            }}
             style={{ width: "100%", borderRadius: 12, background: "#000" }}
           />
 
@@ -965,6 +857,12 @@ function RehabMain({ userName }: { userName: string }) {
             playsInline
             crossOrigin="anonymous"
             preload="auto"
+            onLoadedMetadata={(e) => {
+              const el = e.currentTarget;
+              const durSec = el.duration && Number.isFinite(el.duration) ? el.duration : 3;
+              const durMs = Math.max(1000, Math.round(durSec * 1000));
+              setCurrentTrainDurationMs(durMs);
+            }}
             style={{ display: "none" }}
           />
 
@@ -982,6 +880,15 @@ function RehabMain({ userName }: { userName: string }) {
             <div style={{ marginTop: 6 }}>
               个性化视频数量：{stdVideoList.length}
             </div>
+            <div style={{ marginTop: 6 }}>
+              当前训练视频时长：{(currentTrainDurationMs / 1000).toFixed(1)} 秒
+            </div>
+          </div>
+
+          <div style={{ marginTop: 10, color: trainFinished ? "#7CFC98" : "#ccc" }}>
+            {trainFinished
+              ? trainHint || "该视频训练结束，请点击评价"
+              : "点击 Start Camera 后开始跟随左侧视频训练"}
           </div>
 
           {stdVideoList.length > 0 && (
@@ -1005,6 +912,9 @@ function RehabMain({ userName }: { userName: string }) {
                       onClick={() => {
                         setSelectedStdVideoUrl(url);
                         setStatusText(`已切换到第 ${idx + 1} 个 MusePose 标准视频`);
+                        setTrainFinished(false);
+                        setTrainHint("");
+                        captureDoneRef.current = false;
                       }}
                       style={{
                         textAlign: "left",
@@ -1043,24 +953,9 @@ function RehabMain({ userName }: { userName: string }) {
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-            <div style={{ fontSize: 18, opacity: 0.9 }}>Action:</div>
-            <select
-              value={action}
-              onChange={(e) => setAction(e.target.value as ActionName)}
-              style={{
-                background: "#1a1a1b",
-                color: "#fff",
-                border: "1px solid rgba(255,255,255,0.2)",
-                borderRadius: 10,
-                padding: "6px 10px",
-              }}
-            >
-              {ACTIONS.map((a) => (
-                <option value={a} key={a}>
-                  {a}
-                </option>
-              ))}
-            </select>
+            <div style={{ fontSize: 18, opacity: 0.9 }}>
+              Action: <b>{action}</b>
+            </div>
 
             <button
               onClick={startCamera}
@@ -1094,12 +989,11 @@ function RehabMain({ userName }: { userName: string }) {
             </button>
 
             <button
-              onClick={evaluate}
+              onClick={evaluateAuto}
               disabled={
                 !cameraOn ||
                 !captureDoneRef.current ||
                 isEvaluating ||
-                isConfirming ||
                 !standardReadyRef.current
               }
               style={{
@@ -1111,7 +1005,6 @@ function RehabMain({ userName }: { userName: string }) {
                   !cameraOn ||
                   !captureDoneRef.current ||
                   isEvaluating ||
-                  isConfirming ||
                   !standardReadyRef.current
                     ? "#333"
                     : "#111",
@@ -1120,84 +1013,27 @@ function RehabMain({ userName }: { userName: string }) {
                   !cameraOn ||
                   !captureDoneRef.current ||
                   isEvaluating ||
-                  isConfirming ||
                   !standardReadyRef.current
                     ? "not-allowed"
                     : "pointer",
               }}
             >
-              {isEvaluating ? "Evaluating..." : "Evaluate (3s window)"}
+              {isEvaluating ? "Generating..." : "Evaluate & Feedback"}
             </button>
-
-            <button
-              onClick={pingLLM}
-              disabled={isPinging}
-              style={{
-                padding: "10px 14px",
-                borderRadius: 12,
-                border: "1px solid rgba(120,170,255,0.55)",
-                background: isPinging ? "#333" : "rgba(120,170,255,0.15)",
-                color: "#fff",
-                cursor: isPinging ? "not-allowed" : "pointer",
-              }}
-            >
-              {isPinging ? "Pinging..." : "Ping LLM"}
-            </button>
-
-            <button
-              onClick={confirmLLM}
-              disabled={
-                !cameraOn ||
-                !captureDoneRef.current ||
-                isEvaluating ||
-                isConfirming ||
-                !result ||
-                !standardReadyRef.current
-              }
-              style={{
-                padding: "10px 14px",
-                borderRadius: 12,
-                border: "1px solid rgba(255,180,80,0.55)",
-                background:
-                  !cameraOn ||
-                  !captureDoneRef.current ||
-                  isEvaluating ||
-                  isConfirming ||
-                  !result ||
-                  !standardReadyRef.current
-                    ? "#333"
-                    : "rgba(255,180,80,0.15)",
-                color: "#fff",
-                cursor:
-                  !cameraOn ||
-                  !captureDoneRef.current ||
-                  isEvaluating ||
-                  isConfirming ||
-                  !result ||
-                  !standardReadyRef.current
-                    ? "not-allowed"
-                    : "pointer",
-              }}
-            >
-              {isConfirming ? "Confirming..." : "Confirm (LLM)"}
-            </button>
-
-            <button onClick={playCoachVideoFromLLM} disabled={isCoachPlaying}>
-              {isCoachPlaying ? "生成口播中..." : "播放教练口播讲解"}
-            </button>
-
-            <label style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: 10, opacity: 0.9 }}>
-              <input type="checkbox" checked={useLLM} onChange={(e) => setUseLLM(e.target.checked)} />
-              用大模型生成教练反馈
-            </label>
           </div>
 
           <div style={{ marginTop: 12, opacity: 0.75 }}>
-            Frames: {framesBuffered} ｜ Captured: {captureDoneRef.current ? "✅ 3s" : "⌛ collecting"} ｜ Pose: {poseDetected ? "✅" : "❌"} ｜ Hands: {handsDetected ? "✅" : "❌"} ｜ Std: {standardReadyRef.current ? "✅" : "⌛"}
+            Frames: {framesBuffered} ｜ Captured: {captureDoneRef.current ? "✅ 已完成" : "⌛ 训练中"} ｜ Pose: {poseDetected ? "✅" : "❌"} ｜ Hands: {handsDetected ? "✅" : "❌"} ｜ Std: {standardReadyRef.current ? "✅" : "⌛"}
           </div>
 
           <div>
             StdKeyframes: {stdKeyframesRef.current.length} | UserKeyframes: {userKeyframesRef.current.length}
+          </div>
+
+          <div style={{ marginTop: 10, color: trainFinished ? "#7CFC98" : "#ccc" }}>
+            {trainFinished
+              ? "该视频训练结束，请点击评价"
+              : `当前训练视频时长：${(currentTrainDurationMs / 1000).toFixed(1)} 秒`}
           </div>
 
           <div style={{ position: "relative", marginTop: 12 }}>
@@ -1224,8 +1060,48 @@ function RehabMain({ userName }: { userName: string }) {
             />
           </div>
 
-          <div style={{ marginTop: 14, fontSize: 22, fontWeight: 700 }}>Result</div>
+          <div style={{ marginTop: 16, fontSize: 22, fontWeight: 700 }}>文字反馈</div>
+          <div
+            style={{
+              marginTop: 8,
+              border: "1px solid rgba(255,255,255,0.15)",
+              borderRadius: 14,
+              padding: 14,
+              minHeight: 140,
+              background: "rgba(0,0,0,0.25)",
+              whiteSpace: "pre-wrap",
+              lineHeight: 1.6,
+            }}
+          >
+            {evalError ? evalError : feedbackText || "暂无反馈"}
+          </div>
 
+          <div style={{ marginTop: 16, fontSize: 22, fontWeight: 700 }}>MuseTalk 视频反馈</div>
+          <div
+            style={{
+              marginTop: 8,
+              border: "1px solid rgba(255,255,255,0.15)",
+              borderRadius: 14,
+              padding: 14,
+              minHeight: 120,
+              background: "rgba(0,0,0,0.25)",
+            }}
+          >
+            {coachVideoUrl ? (
+              <video
+                ref={coachPlayerRef}
+                src={coachVideoUrl}
+                controls
+                autoPlay
+                playsInline
+                style={{ width: "100%", borderRadius: 12, background: "#000" }}
+              />
+            ) : (
+              <div style={{ opacity: 0.75 }}>暂无视频反馈</div>
+            )}
+          </div>
+
+          <div style={{ marginTop: 16, fontSize: 22, fontWeight: 700 }}>调试结果</div>
           <div
             style={{
               marginTop: 8,
@@ -1239,17 +1115,7 @@ function RehabMain({ userName }: { userName: string }) {
               lineHeight: 1.4,
             }}
           >
-            {evalError
-              ? evalError
-              : confirmError
-              ? confirmError
-              : pingError
-              ? pingError
-              : JSON.stringify(
-                  { ping: pingResult ?? undefined, evaluate: result ?? undefined, confirm: confirmResult ?? undefined },
-                  null,
-                  2
-                )}
+            {JSON.stringify(result ?? {}, null, 2)}
           </div>
         </div>
       </div>
@@ -1412,9 +1278,9 @@ function App() {
           padding: 24,
         }}
       >
-        <h1 style={{ marginTop: 0, fontSize: 36 }}>Rehab Web MVP</h1>
+        <h1 style={{ marginTop: 0, fontSize: 36 }}>康复训练系统</h1>
         <div style={{ opacity: 0.8, marginBottom: 18 }}>
-          进入系统前先输入姓名。若该姓名没有个人模板视频，则先录制一段 3 秒视频并上传一张个人照片，之后标准动作展示会自动使用该用户对应的 MusePose 生成视频。
+          进入系统前先输入姓名。若该姓名没有个人模板视频，则先录制一段个人模板视频并上传一张个人照片，之后标准动作展示会自动使用该用户对应的 MusePose 生成视频。
         </div>
 
         {step === "entry" && (
@@ -1456,7 +1322,7 @@ function App() {
         {step === "record" && (
           <>
             <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 8 }}>
-              首次使用：请为 “{resolvedName}” 录制 3 秒个人模板视频并上传一张照片
+              首次使用：请为 “{resolvedName}” 录制个人模板视频并上传一张照片
             </div>
             <div style={{ opacity: 0.78, marginBottom: 14 }}>
               建议正脸、光线稳定、嘴部清晰。视频仅首次录制一次，照片用于生成个性化标准动作展示视频。
@@ -1535,7 +1401,7 @@ function App() {
                   cursor: busy ? "not-allowed" : "pointer",
                 }}
               >
-                {busy ? "录制并上传中..." : "开始录制 3 秒并保存"}
+                {busy ? "录制并上传中..." : "开始录制并保存"}
               </button>
               <button
                 onClick={() => {
