@@ -2,7 +2,7 @@
   "user_name": "lzy",
   "safe_name": "lzy",
   "created_at": "2026-03-23T21:46:29",
-  "updated_at": "2026-03-23T22:16:40",
+  "updated_at": "2026-03-25T14:52:55",
   "avatar_path": "D:\\谷歌下载\\system-main\\system-main\\user_templates\\lzy\\avatar.mp4",
   "photo_path": "D:\\谷歌下载\\system-main\\system-main\\user_templates\\lzy\\photo.jpg",
   "avatar_url": "/user_templates/lzy/avatar.mp4",
@@ -10,27 +10,35 @@
   "standard_videos": {
     "raise_arm": {
       "action": "raise_arm",
-      "updated_at": "2026-03-23T22:16:40",
-      "count": 2,
+      "updated_at": "2026-03-25T14:52:55",
+      "demo_count": 3,
+      "success_count": 2,
+      "error_count": 1,
       "items": [
         {
           "id": "pose2",
           "source_demo_video_url": "/demo_action/raise_arm/pose2.mp4",
           "cached": false,
-          "file_name": "001_pose2.mp4",
-          "video_url": "/user_templates/lzy/standard_videos/raise_arm/001_pose2.mp4",
-          "local_path": "D:\\谷歌下载\\system-main\\system-main\\user_templates\\lzy\\standard_videos\\raise_arm\\001_pose2.mp4"
+          "file_name": "001_mimicmotion_pose2.mp4",
+          "video_url": "/user_templates/lzy/standard_videos/raise_arm/001_mimicmotion_pose2.mp4",
+          "local_path": "D:\\谷歌下载\\system-main\\system-main\\user_templates\\lzy\\standard_videos\\raise_arm\\001_mimicmotion_pose2.mp4"
         },
         {
-          "id": "raise_arm",
-          "source_demo_video_url": "/demo_action/raise_arm/raise_arm.mp4",
+          "id": "pose3",
+          "source_demo_video_url": "/demo_action/raise_arm/pose3.mp4",
           "cached": false,
-          "file_name": "002_raise_arm.mp4",
-          "video_url": "/user_templates/lzy/standard_videos/raise_arm/002_raise_arm.mp4",
-          "local_path": "D:\\谷歌下载\\system-main\\system-main\\user_templates\\lzy\\standard_videos\\raise_arm\\002_raise_arm.mp4"
+          "file_name": "002_mimicmotion_pose3.mp4",
+          "video_url": "/user_templates/lzy/standard_videos/raise_arm/002_mimicmotion_pose3.mp4",
+          "local_path": "D:\\谷歌下载\\system-main\\system-main\\user_templates\\lzy\\standard_videos\\raise_arm\\002_mimicmotion_pose3.mp4"
         }
       ],
-      "errors": []
+      "errors": [
+        {
+          "id": "raise_arm",
+          "file_name": "raise_arm.mp4",
+          "error": "RuntimeError: MimicMotion infer failed for raise_arm.mp4: 500 {\"detail\":\"mimicmotion inference failed: Command failed with code -2\\n\\n==== output ====\\nTraceback (most recent call last):\\n  File \\\"/home/scut/lzy/Mimicmotion/inference.py\\\", line 136, in <module>\\n    main(args)\\n  File \\\"/home/scut/anaconda3/envs/mimicmotion/lib/python3.11/site-packages/torch/utils/_contextlib.py\\\", line 115, in decorate_context\\n    return func(*args, **kwargs)\\n           ^^^^^^^^^^^^^^^^^^^^^\\n  File \\\"/home/scut/lzy/Mimicmotion/inference.py\\\", line 91, in main\\n    pipeline = create_pipeline(infer_config, device)\\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\n  File \\\"/home/scut/lzy/Mimicmotion/mimicmotion/utils/loader.py\\\", line 42, in create_pipeline\\n    mimicmotion_models = MimicMotionModel(infer_config.base_model_path)\\n                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\n  File \\\"/home/scut/lzy/Mimicmotion/mimicmotion/utils/loader.py\\\", line 26, in __init__\\n    self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(\\n                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\n  File \\\"/home/scut/anaconda3/envs/mimicmotion/lib/python3.11/site-packages/transformers/modeling_utils.py\\\", line 2876, in from_pretrained\\n    model = cls(config, *model_args, **model_kwargs)\\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\n  File \\\"/home/scut/anaconda3/envs/mimicmotion/lib/python3.11/site-packages/transformers/models/clip/modeling_clip.py\\\", line 1286, in __init__\\n    self.vision_model = CLIPVisionTransformer(config)\\n                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\n  File \\\"/home/scut/anaconda3/envs/mimicmotion/lib/python3.11/site-packages/transformers/models/clip/modeling_clip.py\\\", line 858, in __init__\\n    self.encoder = CLIPEncoder(config)\\n                   ^^^^^^^^^^^^^^^^^^^\\n  File \\\"/home/scut/anaconda3/envs/mimicmotion/lib/python3.11/site-packages/transformers/models/clip/modeling_clip.py\\\", line 587, in __init__\\n    self.layers = nn.ModuleList([CLIPEncoderLayer(config) for _ in range(config.num_hidden_layers)])\\n                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\n  File \\\"/home/scut/anaconda3/envs/mimicmotion/lib/python3.11/site-packages/transformers/models/clip/modeling_clip.py\\\", line 587, in <listcomp>\\n    self.layers = nn.ModuleList([CLIPEncoderLayer(config) for _ in range(config.num_hidden_layers)])\\n                                 ^^^^^^^^^^^^^^^^^^^^^^^^\\n  File \\\"/home/scut/anaconda3/envs/mimicmotion/lib/python3.11/site-packages/transformers/models/clip/modeling_clip.py\\\", line 363, in __init__\\n    self.mlp = CLIPMLP(config)\\n               ^^^^^^^^^^^^^^^\\n  File \\\"/home/scut/anaconda3/envs/mimicmotion/lib/python3.11/site-packages/transformers/models/clip/modeling_clip.py\\\", line 348, in __init__\\n    self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)\\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\n  File \\\"/home/scut/anaconda3/envs/mimicmotio"
+        }
+      ]
     }
   }
 }

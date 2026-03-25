@@ -41,9 +41,16 @@ DASHSCOPE_VL_MODEL = os.getenv("DASHSCOPE_VL_MODEL", "qwen-vl-plus")
 
 STANDARD_DIR = os.getenv("STANDARD_DIR", "./standards")
 MUSETALK_API_BASE = os.getenv("MUSETALK_API_BASE", "http://127.0.0.1:19000")
-MUSEPOSE_API_BASE = os.getenv("MUSEPOSE_API_BASE", "http://127.0.0.1:19001").rstrip("/")
-MUSEPOSE_TIMEOUT = int(os.getenv("MUSEPOSE_TIMEOUT", "3600"))
-MUSEPOSE_LOCK = threading.Lock()
+
+# MimicMotion (Remote API)
+MIMICMOTION_API_BASE = os.getenv("MIMICMOTION_API_BASE", "http://127.0.0.1:19002").rstrip("/")
+MIMICMOTION_TIMEOUT = int(os.getenv("MIMICMOTION_TIMEOUT", "7200"))
+MIMICMOTION_LOCK = threading.Lock()
+
+# Request params passed to MimicMotion service
+MIMICMOTION_NUM_FRAMES = int(os.getenv("MIMICMOTION_NUM_FRAMES", "72"))
+MIMICMOTION_RESOLUTION = int(os.getenv("MIMICMOTION_RESOLUTION", "576"))
+MIMICMOTION_FPS = int(os.getenv("MIMICMOTION_FPS", "15"))
 
 GENERATED_DIR = Path(os.getenv("GENERATED_DIR", "./generated")).resolve()
 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
@@ -655,36 +662,54 @@ def build_generated_standard_item(user_name: str, action: str, out_path: Path) -
     }
 
 
-def call_musepose_with_photo_and_video(
+
+
+def call_mimicmotion_with_photo_and_video(
     photo_path: Path,
     pose_video_path: Path,
     action: str,
-    width: str = "512",
-    height: str = "512",
+    num_frames: int = MIMICMOTION_NUM_FRAMES,
+    resolution: int = MIMICMOTION_RESOLUTION,
+    fps: int = MIMICMOTION_FPS,
 ) -> bytes:
-    with MUSEPOSE_LOCK:
+    if not photo_path.exists():
+        raise FileNotFoundError(f"photo not found: {photo_path}")
+    if not pose_video_path.exists():
+        raise FileNotFoundError(f"pose video not found: {pose_video_path}")
+
+    url = f"{MIMICMOTION_API_BASE}/infer"
+    print(f"[MimicMotion] request start -> action={action}, pose_video={pose_video_path.name}, url={url}")
+
+    with MIMICMOTION_LOCK:
         with open(photo_path, "rb") as f_img, open(pose_video_path, "rb") as f_vid:
             files = {
-                "photo": (photo_path.name, f_img, "image/jpeg"),
-                "pose_video": (pose_video_path.name, f_vid, "video/mp4"),
+                "ref_image": (photo_path.name, f_img, "image/jpeg"),
+                "ref_video": (pose_video_path.name, f_vid, "video/mp4"),
             }
             data = {
                 "action": action,
-                "width": width,
-                "height": height,
+                "num_frames": str(int(num_frames)),
+                "resolution": str(int(resolution)),
+                "fps": str(int(fps)),
             }
-            url = f"{MUSEPOSE_API_BASE}/infer"
-            resp = requests.post(
-                url,
-                files=files,
-                data=data,
-                timeout=MUSEPOSE_TIMEOUT,
-            )
 
-    if resp.status_code != 200:
-        raise RuntimeError(f"MusePose infer failed: {resp.status_code} {resp.text[:3000]}")
+            try:
+                resp = requests.post(url, files=files, data=data, timeout=MIMICMOTION_TIMEOUT)
+            except Exception as e:
+                raise RuntimeError(f"request error for {pose_video_path.name}: {type(e).__name__}: {e}")
 
-    return resp.content
+            print(f"[MimicMotion] response <- pose_video={pose_video_path.name}, status={resp.status_code}, content_length={len(resp.content)}")
+
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"MimicMotion infer failed for {pose_video_path.name}: "
+                    f"{resp.status_code} {resp.text[:3000]}"
+                )
+
+            if not resp.content:
+                raise RuntimeError(f"MimicMotion returned empty content for {pose_video_path.name}")
+
+            return resp.content
 
 
 # =========================
@@ -1267,6 +1292,7 @@ def api_standard_video_info(
             "action": action,
             "demo_count": len(demo_items),
             "generated_count": len(generated_items),
+            "all_generated": len(generated_items) == len(demo_items) and len(demo_items) > 0,
             "demo_videos": demo_items,
             "generated_videos": generated_items,
             "generated_exists": len(generated_items) > 0,
@@ -1291,18 +1317,34 @@ def api_standard_video_build(req: BuildStandardVideoRequest):
         if not demo_video_paths:
             raise HTTPException(status_code=404, detail=f"no demo videos found for action={action}")
 
+        print(f"[standard_video/build] user={user_name}, action={action}, force={force}")
+        print(f"[standard_video/build] demo_video_count={len(demo_video_paths)}")
+        for idx, p in enumerate(demo_video_paths, 1):
+            print(f"[standard_video/build] demo[{idx}] = {p}")
+
         out_dir = get_user_standard_action_dir(user_name, action)
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        if force:
+            for old in out_dir.glob("*"):
+                if _is_video_file(old):
+                    try:
+                        old.unlink()
+                    except Exception as e:
+                        print(f"[standard_video/build] remove old file failed: {old} -> {e}")
 
         results = []
         errors = []
 
         for i, demo_video_path in enumerate(demo_video_paths, 1):
             demo_id = get_demo_action_video_id(demo_video_path)
-            out_name = f"{i:03d}_{demo_id}.mp4"
+            out_name = f"{i:03d}_mimicmotion_{demo_id}.mp4"
             out_path = get_user_generated_standard_path(user_name, action, out_name)
 
+            print(f"[standard_video/build] start {i}/{len(demo_video_paths)} -> demo_id={demo_id}, out={out_path.name}")
+
             if out_path.exists() and not force:
+                print(f"[standard_video/build] skip cached -> {out_path.name}")
                 results.append({
                     "id": demo_id,
                     "source_demo_video_url": get_demo_action_video_public_url(action, demo_video_path),
@@ -1312,15 +1354,19 @@ def api_standard_video_build(req: BuildStandardVideoRequest):
                 continue
 
             try:
-                content = call_musepose_with_photo_and_video(
+                content = call_mimicmotion_with_photo_and_video(
                     photo_path=photo_path,
                     pose_video_path=demo_video_path,
                     action=action,
-                    width="512",
-                    height="512",
+                    num_frames=MIMICMOTION_NUM_FRAMES,
+                    resolution=MIMICMOTION_RESOLUTION,
+                    fps=MIMICMOTION_FPS,
                 )
+
                 with open(out_path, "wb") as f:
                     f.write(content)
+
+                print(f"[standard_video/build] success -> {out_path.name}, bytes={out_path.stat().st_size}")
 
                 results.append({
                     "id": demo_id,
@@ -1328,11 +1374,14 @@ def api_standard_video_build(req: BuildStandardVideoRequest):
                     "cached": False,
                     **build_generated_standard_item(user_name, action, out_path),
                 })
+
             except Exception as e:
+                err_msg = f"{type(e).__name__}: {e}"
+                print(f"[standard_video/build] failed -> demo_id={demo_id}, error={err_msg}")
                 errors.append({
                     "id": demo_id,
                     "file_name": demo_video_path.name,
-                    "error": f"{type(e).__name__}: {e}",
+                    "error": err_msg,
                 })
 
         meta = read_user_meta(user_name)
@@ -1340,7 +1389,9 @@ def api_standard_video_build(req: BuildStandardVideoRequest):
         standard_videos[action] = {
             "action": action,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
-            "count": len(results),
+            "demo_count": len(demo_video_paths),
+            "success_count": len(results),
+            "error_count": len(errors),
             "items": results,
             "errors": errors,
         }
@@ -1348,11 +1399,16 @@ def api_standard_video_build(req: BuildStandardVideoRequest):
         meta["updated_at"] = datetime.now().isoformat(timespec="seconds")
         write_user_meta(user_name, meta)
 
+        fully_ok = (len(results) == len(demo_video_paths) and len(demo_video_paths) > 0)
+
         return {
             "ok": len(results) > 0,
+            "fully_ok": fully_ok,
             "user_name": user_name,
             "action": action,
-            "count": len(results),
+            "demo_count": len(demo_video_paths),
+            "success_count": len(results),
+            "error_count": len(errors),
             "results": results,
             "errors": errors,
         }
