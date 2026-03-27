@@ -7,6 +7,7 @@ import inspect
 import re
 import json
 import base64
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -42,12 +43,10 @@ DASHSCOPE_VL_MODEL = os.getenv("DASHSCOPE_VL_MODEL", "qwen-vl-plus")
 STANDARD_DIR = os.getenv("STANDARD_DIR", "./standards")
 MUSETALK_API_BASE = os.getenv("MUSETALK_API_BASE", "http://127.0.0.1:19000")
 
-# MimicMotion (Remote API)
 MIMICMOTION_API_BASE = os.getenv("MIMICMOTION_API_BASE", "http://127.0.0.1:19002").rstrip("/")
 MIMICMOTION_TIMEOUT = int(os.getenv("MIMICMOTION_TIMEOUT", "7200"))
 MIMICMOTION_LOCK = threading.Lock()
 
-# Request params passed to MimicMotion service
 MIMICMOTION_NUM_FRAMES = int(os.getenv("MIMICMOTION_NUM_FRAMES", "72"))
 MIMICMOTION_RESOLUTION = int(os.getenv("MIMICMOTION_RESOLUTION", "576"))
 MIMICMOTION_FPS = int(os.getenv("MIMICMOTION_FPS", "15"))
@@ -74,9 +73,17 @@ ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 # =========================
+# Logging helper
+# =========================
+def stage_log(tag: str, message: str) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] [{tag}] {message}", flush=True)
+
+
+# =========================
 # FastAPI
 # =========================
-app = FastAPI(title="Rehab Web Server", version="0.5.0")
+app = FastAPI(title="Rehab Web Server", version="0.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -107,20 +114,23 @@ def build_evaluator() -> PoseEvaluator:
         params = list(sig.parameters.values())
 
         if any(p.name == "standard_dir" for p in params):
+            stage_log("Init", f"PoseEvaluator init with standard_dir={STANDARD_DIR}")
             return PoseEvaluator(standard_dir=STANDARD_DIR)
 
         required_positional = [
-            p
-            for p in params
+            p for p in params
             if p.default is inspect._empty
             and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
         ]
         if len(required_positional) >= 1:
+            stage_log("Init", f"PoseEvaluator init with positional standard_dir={STANDARD_DIR}")
             return PoseEvaluator(STANDARD_DIR)
 
+        stage_log("Init", "PoseEvaluator init with default constructor")
         return PoseEvaluator()
 
     except Exception as e:
+        stage_log("Init", f"PoseEvaluator first init failed: {type(e).__name__}: {e}")
         try:
             return PoseEvaluator()
         except Exception:
@@ -128,6 +138,109 @@ def build_evaluator() -> PoseEvaluator:
 
 
 evaluator = build_evaluator()
+
+
+# =========================
+# Score helpers
+# =========================
+def _normalize_percent(x: Any) -> Optional[float]:
+    try:
+        v = float(x)
+    except Exception:
+        return None
+
+    if not math.isfinite(v):
+        return None
+
+    if 0.0 <= v <= 1.0:
+        return max(0.0, min(100.0, v * 100.0))
+    return max(0.0, min(100.0, v))
+
+
+def _normalize_dtw_to_score(dtw_score: Any) -> float:
+    try:
+        v = float(dtw_score)
+    except Exception:
+        return 60.0
+
+    if not math.isfinite(v):
+        return 60.0
+
+    if v < 0:
+        v = 0.0
+
+    if 0.0 <= v <= 1.0:
+        return max(0.0, min(100.0, v * 100.0))
+
+    score = 100.0 * math.exp(-v / 0.35)
+    return max(0.0, min(100.0, score))
+
+
+def _normalize_joint_errors_to_score(joint_errors: Any) -> float:
+    if not isinstance(joint_errors, dict) or not joint_errors:
+        return 70.0
+
+    vals: List[float] = []
+    for _, val in joint_errors.items():
+        try:
+            x = float(val)
+            if math.isfinite(x):
+                vals.append(max(0.0, x))
+        except Exception:
+            pass
+
+    if not vals:
+        return 70.0
+
+    mean_err = sum(vals) / len(vals)
+    score = 100.0 * math.exp(-mean_err / 0.20)
+    return max(0.0, min(100.0, score))
+
+
+def compute_rehab_score(metric_out: Dict[str, Any]) -> Dict[str, Any]:
+    acc_score = _normalize_percent(metric_out.get("accuracy"))
+    if acc_score is None:
+        acc_score = 60.0
+
+    dtw_score_norm = _normalize_dtw_to_score(metric_out.get("dtw_score"))
+    joint_score = _normalize_joint_errors_to_score(metric_out.get("joint_errors"))
+
+    raw_score = (
+        0.50 * acc_score +
+        0.20 * dtw_score_norm +
+        0.30 * joint_score
+    )
+
+    rule_comments = metric_out.get("rule_based_comments", []) or []
+    penalty = min(10.0, 1.5 * len(rule_comments))
+
+    final_score = raw_score - penalty
+
+    user_frames = metric_out.get("_meta", {}).get("user_frames", 0) if isinstance(metric_out.get("_meta"), dict) else 0
+    if user_frames >= 3:
+        final_score = max(20.0, final_score)
+
+    final_score = max(0.0, min(100.0, final_score))
+
+    if final_score >= 85:
+        level = "优秀"
+    elif final_score >= 70:
+        level = "良好"
+    elif final_score >= 60:
+        level = "合格"
+    else:
+        level = "待提升"
+
+    return {
+        "score": round(final_score, 1),
+        "score_breakdown": {
+            "accuracy_score": round(acc_score, 1),
+            "dtw_score_norm": round(dtw_score_norm, 1),
+            "joint_score": round(joint_score, 1),
+            "rule_penalty": round(penalty, 1),
+        },
+        "score_level": level,
+    }
 
 
 # =========================
@@ -237,13 +350,8 @@ def llm_confirm_judge(action: str, eval_result: Dict[str, Any]) -> Dict[str, Any
   "key_issues": ["问题1","问题2"],
   "tips": ["建议1","建议2","建议3"]
 }}
-
-要求：
-- 不要出现“DTW/accuracy”等词
-- 如果信息不足，也要给出保守判断，并在 overall 里说明“建议补采更稳定动作”
 """.strip()
 
-    t0 = time.time()
     resp = client.chat.completions.create(
         model=DASHSCOPE_MODEL,
         messages=[
@@ -253,7 +361,6 @@ def llm_confirm_judge(action: str, eval_result: Dict[str, Any]) -> Dict[str, Any
         temperature=0.1,
         max_tokens=256,
     )
-    latency = time.time() - t0
     text = (resp.choices[0].message.content or "").strip()
 
     try:
@@ -262,7 +369,6 @@ def llm_confirm_judge(action: str, eval_result: Dict[str, Any]) -> Dict[str, Any
             text = text.replace("json", "", 1).strip()
         data = json.loads(text)
         data["model"] = DASHSCOPE_MODEL
-        data["latency_sec"] = round(latency, 3)
         return data
     except Exception:
         return {
@@ -272,39 +378,8 @@ def llm_confirm_judge(action: str, eval_result: Dict[str, Any]) -> Dict[str, Any
             "key_issues": [],
             "tips": [],
             "model": DASHSCOPE_MODEL,
-            "latency_sec": round(latency, 3),
             "raw": text,
         }
-
-
-def tts_text_to_wav(text: str, out_wav: Path) -> None:
-    text = (text or "").strip()
-    if not text:
-        raise RuntimeError("Empty TTS text")
-
-    out_wav.parent.mkdir(parents=True, exist_ok=True)
-
-    tmp_mp3 = out_wav.with_suffix(".mp3")
-    try:
-        cmd = [
-            sys.executable, "-m", "edge_tts",
-            "--text", text,
-            "--voice", os.getenv("TTS_VOICE", "zh-CN-XiaoxiaoNeural"),
-            "--write-media", str(tmp_mp3),
-        ]
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        if p.returncode != 0 or (not tmp_mp3.exists()):
-            raise RuntimeError(p.stdout[-2000:])
-    except Exception as e:
-        raise RuntimeError(
-            f"TTS failed. Please `pip install edge-tts` and ensure network OK. Detail: {type(e).__name__}: {e}"
-        )
-
-    ff = os.getenv("FFMPEG_BIN", "ffmpeg")
-    cmd_ff = [ff, "-y", "-i", str(tmp_mp3), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(out_wav)]
-    p2 = subprocess.run(cmd_ff, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if p2.returncode != 0 or (not out_wav.exists()):
-        raise RuntimeError(f"ffmpeg convert failed: {p2.stdout[-2000:]}")
 
 
 def llm_confirm_judge_by_images(
@@ -338,11 +413,6 @@ def llm_confirm_judge_by_images(
 任务：对比“标准动作关键帧”和“用户动作关键帧”，判断用户动作是否基本达标，并给出简洁、可执行建议。
 
 动作名称：{action}
-
-输入说明：
-- 先给你【标准动作关键帧】（按时间顺序）
-- 再给你【用户动作关键帧】（按时间顺序）
-- 重点比较：动作幅度、抬起高度、左右对称性、时序一致性、是否有明显代偿
 {helper_text}
 
 输出要求（严格 JSON，仅 JSON，不要任何多余文字）：
@@ -353,49 +423,37 @@ def llm_confirm_judge_by_images(
   "key_issues": ["问题1", "问题2"],
   "tips": ["建议1", "建议2", "建议3"]
 }}
-
-要求：
-- 中文输出
-- confidence 在 0~1
-- 如果图像不清楚或看不全，请保守判断并在 overall / key_issues 里说明
-- 不要提模型、分辨率、像素等技术词
 """.strip()
 
     content_items = [{"type": "text", "text": prompt_text}]
-
-    content_items.append({"type": "text", "text": "下面是【标准动作关键帧】（按时间顺序）"})
+    content_items.append({"type": "text", "text": "下面是【标准动作关键帧】"})
     for i, img in enumerate(standard_images, 1):
         content_items.append({"type": "text", "text": f"标准帧{i}"})
         content_items.append({"type": "image_url", "image_url": {"url": img}})
 
-    content_items.append({"type": "text", "text": "下面是【用户动作关键帧】（按时间顺序）"})
+    content_items.append({"type": "text", "text": "下面是【用户动作关键帧】"})
     for i, img in enumerate(user_images, 1):
         content_items.append({"type": "text", "text": f"用户帧{i}"})
         content_items.append({"type": "image_url", "image_url": {"url": img}})
 
-    t0 = time.time()
     resp = client.chat.completions.create(
         model=DASHSCOPE_VL_MODEL,
         messages=[
-          {"role": "system", "content": "Return valid JSON only."},
-          {"role": "user", "content": content_items},
+            {"role": "system", "content": "Return valid JSON only."},
+            {"role": "user", "content": content_items},
         ],
         temperature=0.1,
         max_tokens=512,
     )
-    latency = time.time() - t0
 
     text = (resp.choices[0].message.content or "").strip()
-
     try:
         if text.startswith("```"):
             text = text.strip("`")
             text = text.replace("json", "", 1).strip()
-
         data = json.loads(text)
         data["mode"] = "vision_keyframes"
         data["model"] = DASHSCOPE_VL_MODEL
-        data["latency_sec"] = round(latency, 3)
         return data
     except Exception:
         return {
@@ -406,26 +464,50 @@ def llm_confirm_judge_by_images(
             "tips": ["稍后重试", "检查视觉模型配置"],
             "mode": "vision_keyframes",
             "model": DASHSCOPE_VL_MODEL,
-            "latency_sec": round(latency, 3),
             "raw": text,
         }
 
 
+def tts_text_to_wav(text: str, out_wav: Path) -> None:
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("Empty TTS text")
+
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+    tmp_mp3 = out_wav.with_suffix(".mp3")
+
+    cmd = [
+        sys.executable, "-m", "edge_tts",
+        "--text", text,
+        "--voice", os.getenv("TTS_VOICE", "zh-CN-XiaoxiaoNeural"),
+        "--write-media", str(tmp_mp3),
+    ]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if p.returncode != 0 or (not tmp_mp3.exists()):
+        raise RuntimeError(f"TTS failed: {p.stdout[-2000:]}")
+
+    ff = os.getenv("FFMPEG_BIN", "ffmpeg")
+    cmd_ff = [ff, "-y", "-i", str(tmp_mp3), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(out_wav)]
+    p2 = subprocess.run(cmd_ff, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if p2.returncode != 0 or (not out_wav.exists()):
+        raise RuntimeError(f"ffmpeg convert failed: {p2.stdout[-2000:]}")
+
+
+# =========================
+# Utility: images / storage
+# =========================
 def _save_dataurl_image(data_url: str, out_path: Path) -> bool:
     try:
         if not data_url or "," not in data_url:
             return False
-
         header, b64data = data_url.split(",", 1)
         if "base64" not in header:
             return False
-
         raw = base64.b64decode(b64data)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(raw)
         return True
-    except Exception as e:
-        print(f"[save_dataurl_image] failed: {e}")
+    except Exception:
         return False
 
 
@@ -447,18 +529,12 @@ def save_compare_keyframes(
     saved_usr = []
 
     for i, data_url in enumerate(standard_images or [], 1):
-        ext = ".jpg"
-        if data_url.startswith("data:image/png"):
-            ext = ".png"
-        out_path = std_dir / f"std_{i:02d}{ext}"
+        out_path = std_dir / f"std_{i:02d}.jpg"
         if _save_dataurl_image(data_url, out_path):
             saved_std.append(str(out_path))
 
     for i, data_url in enumerate(user_images or [], 1):
-        ext = ".jpg"
-        if data_url.startswith("data:image/png"):
-            ext = ".png"
-        out_path = usr_dir / f"user_{i:02d}{ext}"
+        out_path = usr_dir / f"user_{i:02d}.jpg"
         if _save_dataurl_image(data_url, out_path):
             saved_usr.append(str(out_path))
 
@@ -472,12 +548,12 @@ def save_compare_keyframes(
 
 
 def save_json_file(path: Path, data: Dict[str, Any]):
-    try:
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        print(f"[save_json_file] failed: {e}")
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# =========================
+# User/profile/path helpers
+# =========================
 def normalize_user_name(name: str) -> str:
     name = (name or "").strip()
     if not name:
@@ -485,6 +561,12 @@ def normalize_user_name(name: str) -> str:
     safe = re.sub(r"[^\u4e00-\u9fa5a-zA-Z0-9_-]", "_", name)
     safe = safe.strip("_") or "user"
     return safe[:50]
+
+
+def normalize_video_id(video_id: str) -> str:
+    video_id = (video_id or "").strip()
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", video_id)
+    return safe or "default"
 
 
 def get_user_dir(name: str) -> Path:
@@ -519,6 +601,64 @@ def get_user_standard_action_dir(user_name: str, action: str) -> Path:
     return p
 
 
+def get_user_plan_path(name: str, action: str, video_id: str) -> Path:
+    safe_video_id = normalize_video_id(video_id)
+    return get_user_dir(name) / "train_plans" / action / f"{safe_video_id}.json"
+
+
+def default_train_plan() -> Dict[str, Any]:
+    return {
+        "current_round": 1,
+        "max_rounds": 4,
+        "current_target": 0.75,
+        "current_threshold": 15.0,
+        "target_min": 0.60,
+        "target_max": 0.95,
+        "threshold_min": 5.0,
+        "threshold_max": 30.0,
+        "goal_step": 0.08,
+        "threshold_step": 3.0,
+        "alpha": 0.40,
+        "beta": 0.25,
+        "gamma": 0.25,
+        "delta": 0.10,
+        "base_value": 0.50,
+        "joint_weights": {
+            "shoulder": 0.7,
+            "elbow": 0.3,
+        },
+        "history": [],
+        "is_finished": False,
+    }
+
+
+def load_train_plan(name: str, action: str, video_id: str) -> Dict[str, Any]:
+    path = get_user_plan_path(name, action, video_id)
+    if not path.exists():
+        plan = default_train_plan()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+        return plan
+
+    try:
+        plan = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(plan, dict):
+            return default_train_plan()
+        if "max_rounds" not in plan:
+            plan["max_rounds"] = 4
+        if "is_finished" not in plan:
+            plan["is_finished"] = False
+        return plan
+    except Exception:
+        return default_train_plan()
+
+
+def save_train_plan(name: str, action: str, video_id: str, plan: Dict[str, Any]) -> None:
+    path = get_user_plan_path(name, action, video_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def save_upload_to_path(src: UploadFile, dst: Path):
     dst.parent.mkdir(parents=True, exist_ok=True)
     with open(dst, "wb") as f:
@@ -537,13 +677,7 @@ def transcode_to_mp4(src_path: Path, dst_path: Path):
         "-movflags", "+faststart",
         str(dst_path),
     ]
-    try:
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-    except FileNotFoundError:
-        raise RuntimeError("ffmpeg not found. Please install ffmpeg and ensure it is in PATH.")
-    except subprocess.CalledProcessError as e:
-        err = (e.stderr or b"").decode("utf-8", errors="ignore")
-        raise RuntimeError(f"ffmpeg transcode failed: {err[:1000]}")
+    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
 
 
 def image_to_jpg(src_path: Path, dst_path: Path) -> None:
@@ -583,12 +717,14 @@ def build_user_profile(name: str) -> Dict[str, Any]:
     user_dir = get_user_dir(name)
     video_path = get_user_video_path(name)
     meta_path = get_user_meta_path(name)
+
     meta: Dict[str, Any] = {}
     if meta_path.exists():
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except Exception:
             meta = {}
+
     return {
         "ok": True,
         "user_name": name,
@@ -600,22 +736,11 @@ def build_user_profile(name: str) -> Dict[str, Any]:
     }
 
 
+# =========================
+# Demo/standard video helpers
+# =========================
 def _is_video_file(p: Path) -> bool:
     return p.is_file() and p.suffix.lower() in ALLOWED_VIDEO_EXTS
-
-
-def get_demo_action_video_path(action: str) -> Path:
-    flat = DEMO_ACTION_DIR / f"{action}.mp4"
-    if flat.exists():
-        return flat
-
-    action_dir = DEMO_ACTION_DIR / action
-    if action_dir.exists() and action_dir.is_dir():
-        candidates = [p for p in sorted(action_dir.iterdir()) if _is_video_file(p)]
-        if candidates:
-            return candidates[0]
-
-    raise FileNotFoundError(f"demo action video not found for action={action}")
 
 
 def get_demo_action_video_paths(action: str) -> List[Path]:
@@ -662,8 +787,6 @@ def build_generated_standard_item(user_name: str, action: str, out_path: Path) -
     }
 
 
-
-
 def call_mimicmotion_with_photo_and_video(
     photo_path: Path,
     pose_video_path: Path,
@@ -678,7 +801,6 @@ def call_mimicmotion_with_photo_and_video(
         raise FileNotFoundError(f"pose video not found: {pose_video_path}")
 
     url = f"{MIMICMOTION_API_BASE}/infer"
-    print(f"[MimicMotion] request start -> action={action}, pose_video={pose_video_path.name}, url={url}")
 
     with MIMICMOTION_LOCK:
         with open(photo_path, "rb") as f_img, open(pose_video_path, "rb") as f_vid:
@@ -693,27 +815,87 @@ def call_mimicmotion_with_photo_and_video(
                 "fps": str(int(fps)),
             }
 
-            try:
-                resp = requests.post(url, files=files, data=data, timeout=MIMICMOTION_TIMEOUT)
-            except Exception as e:
-                raise RuntimeError(f"request error for {pose_video_path.name}: {type(e).__name__}: {e}")
-
-            print(f"[MimicMotion] response <- pose_video={pose_video_path.name}, status={resp.status_code}, content_length={len(resp.content)}")
-
+            resp = requests.post(url, files=files, data=data, timeout=MIMICMOTION_TIMEOUT)
             if resp.status_code != 200:
                 raise RuntimeError(
                     f"MimicMotion infer failed for {pose_video_path.name}: "
                     f"{resp.status_code} {resp.text[:3000]}"
                 )
-
             if not resp.content:
                 raise RuntimeError(f"MimicMotion returned empty content for {pose_video_path.name}")
-
             return resp.content
 
 
 # =========================
-# Request/Response Models
+# Training plan helpers
+# =========================
+def compute_overall_error_from_joint_errors(
+    joint_errors: Dict[str, Any],
+    joint_weights: Optional[Dict[str, Any]] = None,
+) -> float:
+    weights = joint_weights or {"shoulder": 0.7, "elbow": 0.3}
+    total = 0.0
+    weight_sum = 0.0
+    for k, w in weights.items():
+        total += float(joint_errors.get(k, 0.0)) * float(w)
+        weight_sum += float(w)
+    if weight_sum <= 1e-8:
+        return 0.0
+    return float(total / weight_sum)
+
+
+def normalize_error(overall_error: float, err_min: float = 0.0, err_max: float = 40.0) -> float:
+    if err_max <= err_min:
+        return 0.0
+    x = (float(overall_error) - float(err_min)) / (float(err_max) - float(err_min))
+    return max(0.0, min(1.0, x))
+
+
+def compute_training_state(
+    accuracy: float,
+    normalized_error_value: float,
+    pass_flag: int,
+    key_issue_count: int,
+    alpha: float,
+    beta: float,
+    gamma: float,
+    delta: float,
+) -> float:
+    state = (
+        float(alpha) * float(accuracy)
+        + float(beta) * float(1.0 - normalized_error_value)
+        + float(gamma) * float(pass_flag)
+        - float(delta) * float(key_issue_count)
+    )
+    return float(state)
+
+
+def update_goal_and_threshold(
+    current_target: float,
+    current_threshold: float,
+    state_value: float,
+    base_value: float,
+    goal_step: float,
+    threshold_step: float,
+    target_min: float,
+    target_max: float,
+    threshold_min: float,
+    threshold_max: float,
+) -> Dict[str, float]:
+    next_target = float(current_target) + float(goal_step) * (float(state_value) - float(base_value))
+    next_threshold = float(current_threshold) - float(threshold_step) * (float(state_value) - float(base_value))
+
+    next_target = max(float(target_min), min(float(target_max), next_target))
+    next_threshold = max(float(threshold_min), min(float(threshold_max), next_threshold))
+
+    return {
+        "next_target": float(next_target),
+        "next_threshold": float(next_threshold),
+    }
+
+
+# =========================
+# Request Models
 # =========================
 class FrameIn(BaseModel):
     pose: List[List[float]] = Field(..., description="33 x 3 pose landmarks")
@@ -751,102 +933,23 @@ class BuildStandardVideoRequest(BaseModel):
     force: Optional[bool] = False
 
 
-class EvaluateAutoRequest(BaseModel):
-    action: str
+class TrainPlanUpdateRequest(BaseModel):
     user_name: str
-    frames: Optional[List[FrameIn]] = None
-    user_seq: Optional[List[FrameIn]] = None
-    standard_seq: Optional[List[FrameIn]] = None
-    standard_images: Optional[List[str]] = None
-    user_images: Optional[List[str]] = None
-    use_llm: Optional[bool] = True
+    action: str
+    video_id: str
+    eval_result: Dict[str, Any]
+    llm_confirm: Optional[Dict[str, Any]] = None
+
+
+class TrainPlanResetRequest(BaseModel):
+    user_name: str
+    action: str
+    video_id: str
 
 
 # =========================
-# Helper for evaluate_auto
+# Core evaluation
 # =========================
-def build_coach_script(confirm_out: Dict[str, Any], eval_out: Optional[Dict[str, Any]] = None) -> str:
-    overall = str((confirm_out or {}).get("overall") or "").strip()
-    key_issues = (confirm_out or {}).get("key_issues") or []
-    tips = (confirm_out or {}).get("tips") or []
-
-    if not overall and eval_out:
-        overall = str(eval_out.get("llm_feedback") or "").strip()
-
-    lines: List[str] = []
-
-    if overall:
-        lines.append(f"本次动作评估结果：{overall}")
-
-    if key_issues:
-        clean_issues = [str(x).strip() for x in key_issues if str(x).strip()]
-        if clean_issues:
-            lines.append("主要问题有：" + "；".join(clean_issues[:3]) + "。")
-
-    if tips:
-        clean_tips = [str(x).strip() for x in tips if str(x).strip()]
-        if clean_tips:
-            lines.append("建议你这样调整：" + "；".join(clean_tips[:3]) + "。")
-
-    if not lines:
-        lines.append("本次动作已完成评估。请继续保持动作稳定，注意幅度和节奏一致。")
-
-    return "\n".join(lines)
-
-
-def generate_musetalk_feedback_video(
-    user_name: str,
-    text: str,
-    version: str = "v1.5",
-    mode: str = "normal",
-) -> str:
-    if not text.strip():
-        raise RuntimeError("feedback text is empty")
-
-    video_path = get_user_video_path(user_name)
-    if not video_path.exists():
-        raise RuntimeError("user template video not found, please register first")
-
-    uid = uuid.uuid4().hex[:10]
-    safe_name = normalize_user_name(user_name)
-    out_mp4 = GENERATED_DIR / f"coach_{safe_name}_{uid}.mp4"
-
-    with tempfile.TemporaryDirectory(prefix="coach_video_") as td:
-        td = Path(td)
-        tts_wav = td / "tts.wav"
-
-        tts_text_to_wav(text, tts_wav)
-
-        with MUSETALK_LOCK:
-            url = MUSETALK_API_BASE.rstrip("/") + "/infer"
-            video_fp = open(video_path, "rb")
-            audio_fp = open(tts_wav, "rb")
-            files = {
-                "video": (video_path.name, video_fp, "video/mp4"),
-                "audio": (tts_wav.name, audio_fp, "audio/wav"),
-            }
-            data = {"version": version, "mode": mode}
-            try:
-                r = requests.post(url, data=data, files=files, timeout=1800)
-            finally:
-                try:
-                    video_fp.close()
-                except Exception:
-                    pass
-                try:
-                    audio_fp.close()
-                except Exception:
-                    pass
-
-        if r.status_code != 200:
-            raise RuntimeError(f"MuseTalk failed: {r.text[:1000]}")
-
-        with open(out_mp4, "wb") as f:
-            f.write(r.content)
-
-    return f"/generated/{out_mp4.name}"
-
-
 def run_evaluate_core(req: EvalRequest) -> Dict[str, Any]:
     user_in = req.frames if req.frames is not None else req.user_seq
     if not user_in:
@@ -882,6 +985,11 @@ def run_evaluate_core(req: EvalRequest) -> Dict[str, Any]:
         "use_llm_feedback": bool(req.use_llm),
     }
 
+    score_info = compute_rehab_score(out)
+    out["score"] = score_info["score"]
+    out["score_breakdown"] = score_info["score_breakdown"]
+    out["score_level"] = score_info["score_level"]
+
     if req.use_llm:
         try:
             out["llm_feedback"] = llm_action_feedback(req.action, out)
@@ -894,6 +1002,9 @@ def run_evaluate_core(req: EvalRequest) -> Dict[str, Any]:
     return out
 
 
+# =========================
+# Routes
+# =========================
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True}
@@ -905,297 +1016,6 @@ def api_profile_check(name: str) -> Dict[str, Any]:
         return build_user_profile(name)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"profile check failed: {type(e).__name__}: {e}")
-
-
-@app.get("/api/profile/info_legacy")
-def api_profile_info_legacy(name: str) -> Dict[str, Any]:
-    try:
-        return build_user_profile(name)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"profile info failed: {type(e).__name__}: {e}")
-
-
-@app.post("/api/profile/register")
-async def api_profile_register(
-    name: str = Form(...),
-    video: UploadFile = File(...),
-) -> Dict[str, Any]:
-    try:
-        user_dir = get_user_dir(name)
-        user_dir.mkdir(parents=True, exist_ok=True)
-
-        raw_ext = Path(video.filename or "avatar.webm").suffix or ".webm"
-        raw_path = user_dir / f"raw{raw_ext}"
-        mp4_path = user_dir / "avatar.mp4"
-
-        save_upload_to_path(video, raw_path)
-        transcode_to_mp4(raw_path, mp4_path)
-
-        meta = {
-            "user_name": name,
-            "safe_name": normalize_user_name(name),
-            "video_path": str(mp4_path),
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "source_filename": video.filename,
-        }
-        get_user_meta_path(name).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        return {
-            "ok": True,
-            "message": "profile registered",
-            "video_path": str(mp4_path),
-            "profile": build_user_profile(name),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"profile register failed: {type(e).__name__}: {e}")
-
-
-@app.get("/api/llm_ping")
-def api_llm_ping() -> Dict[str, Any]:
-    try:
-        return llm_ping()
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"LLM ping failed: {type(e).__name__}: {e}",
-        )
-
-
-@app.get("/api/confirm")
-def api_confirm_get() -> Dict[str, Any]:
-    try:
-        return llm_ping()
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"LLM confirm GET failed: {type(e).__name__}: {e}",
-        )
-
-
-@app.post("/api/confirm")
-def api_confirm_post(req: ConfirmRequest) -> Dict[str, Any]:
-    try:
-        if req.frames is not None and len(req.frames) < 3:
-            raise HTTPException(status_code=400, detail="Too few valid frames (<3).")
-
-        if req.standard_images and req.user_images:
-            std_imgs = (req.standard_images or [])[:6]
-            usr_imgs = (req.user_images or [])[:6]
-
-            save_info = save_compare_keyframes(
-                action=req.action,
-                standard_images=std_imgs,
-                user_images=usr_imgs,
-            )
-
-            llm_out = llm_confirm_judge_by_images(
-                action=req.action,
-                standard_images=std_imgs,
-                user_images=usr_imgs,
-                eval_result=req.eval_result,
-            )
-
-            try:
-                save_json_file(Path(save_info["session_dir"]) / "llm_result.json", llm_out)
-            except Exception:
-                pass
-
-            return {
-                "action": req.action,
-                "confirm_mode": "vision_keyframes",
-                "llm_confirm": llm_out,
-                "saved_frames": {
-                    "session_dir": save_info["session_dir"],
-                    "saved_standard_count": save_info["saved_standard_count"],
-                    "saved_user_count": save_info["saved_user_count"],
-                },
-            }
-
-        llm_out = llm_confirm_judge(req.action, req.eval_result or {})
-
-        return {
-            "action": req.action,
-            "confirm_mode": "json_eval",
-            "llm_confirm": llm_out,
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"LLM confirm POST failed: {type(e).__name__}: {e}",
-        )
-
-
-@app.post("/api/evaluate")
-def api_evaluate(req: EvalRequest) -> Dict[str, Any]:
-    try:
-        return run_evaluate_core(req)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Server error: {type(e).__name__}: {e}")
-
-
-@app.post("/api/evaluate_auto")
-def api_evaluate_auto(req: EvaluateAutoRequest) -> Dict[str, Any]:
-    try:
-        eval_req = EvalRequest(
-            action=req.action,
-            frames=req.frames,
-            user_seq=req.user_seq,
-            standard_seq=req.standard_seq,
-            use_llm=req.use_llm,
-        )
-        eval_out = run_evaluate_core(eval_req)
-
-        confirm_out: Dict[str, Any]
-        save_info: Optional[Dict[str, Any]] = None
-
-        std_imgs = (req.standard_images or [])[:6]
-        usr_imgs = (req.user_images or [])[:6]
-
-        if req.use_llm and len(std_imgs) >= 2 and len(usr_imgs) >= 2:
-            save_info = save_compare_keyframes(
-                action=req.action,
-                standard_images=std_imgs,
-                user_images=usr_imgs,
-            )
-
-            confirm_out = llm_confirm_judge_by_images(
-                action=req.action,
-                standard_images=std_imgs,
-                user_images=usr_imgs,
-                eval_result=eval_out,
-            )
-
-            try:
-                save_json_file(Path(save_info["session_dir"]) / "llm_result.json", confirm_out)
-            except Exception:
-                pass
-        elif req.use_llm:
-            confirm_out = llm_confirm_judge(req.action, eval_out)
-        else:
-            confirm_out = {
-                "is_pass": None,
-                "confidence": 0.0,
-                "overall": "已完成动作评估。",
-                "key_issues": eval_out.get("rule_based_comments", [])[:3],
-                "tips": eval_out.get("rule_based_comments", [])[:3],
-                "mode": "rule_only",
-            }
-
-        feedback_text = build_coach_script(confirm_out, eval_out)
-
-        coach_video_url = ""
-        coach_video_error = ""
-        try:
-            coach_video_url = generate_musetalk_feedback_video(
-                user_name=req.user_name,
-                text=feedback_text,
-                version="v1.5",
-                mode="normal",
-            )
-        except Exception as e:
-            coach_video_error = f"{type(e).__name__}: {e}"
-
-        return {
-            "ok": True,
-            "action": req.action,
-            "user_name": req.user_name,
-            "evaluate": eval_out,
-            "confirm": confirm_out,
-            "feedback_text": feedback_text,
-            "coach_video_url": coach_video_url,
-            "coach_video_error": coach_video_error,
-            "saved_frames": {
-                "session_dir": save_info["session_dir"],
-                "saved_standard_count": save_info["saved_standard_count"],
-                "saved_user_count": save_info["saved_user_count"],
-            } if save_info else None,
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"evaluate_auto failed: {type(e).__name__}: {e}")
-
-
-@app.post("/api/coach_video_v2")
-def api_coach_video_v2(req: CoachVideoRequest) -> Dict[str, Any]:
-    if not req.text.strip():
-        raise HTTPException(status_code=422, detail="text is empty")
-
-    try:
-        url = generate_musetalk_feedback_video(
-            user_name=req.user_name,
-            text=req.text,
-            version=req.version or "v1.5",
-            mode=req.mode or "normal",
-        )
-        return {
-            "ok": True,
-            "url": url,
-            "text": req.text,
-            "user_name": req.user_name,
-            "template_video": str(get_user_video_path(req.user_name)),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"coach_video_v2 failed: {type(e).__name__}: {e}")
-
-
-@app.post("/api/coach_video")
-def api_coach_video(
-    video: UploadFile = File(...),
-    text: str = Form(...),
-    version: str = Form("v1.5"),
-    mode: str = Form("normal"),
-) -> Dict[str, Any]:
-    if not text.strip():
-        raise HTTPException(status_code=422, detail="text is empty")
-
-    uid = uuid.uuid4().hex[:10]
-    out_mp4 = GENERATED_DIR / f"coach_{uid}.mp4"
-
-    with tempfile.TemporaryDirectory(prefix="coach_video_") as td:
-        td = Path(td)
-        in_video = td / (video.filename or "standard.mp4")
-        tts_wav = td / "tts.wav"
-
-        with open(in_video, "wb") as f:
-            shutil.copyfileobj(video.file, f)
-
-        tts_text_to_wav(text, tts_wav)
-
-        with MUSETALK_LOCK:
-            url = MUSETALK_API_BASE.rstrip("/") + "/infer"
-            files = {
-                "video": (in_video.name, open(in_video, "rb"), "video/mp4"),
-                "audio": (tts_wav.name, open(tts_wav, "rb"), "audio/wav"),
-            }
-            data = {"version": version, "mode": mode}
-
-            try:
-                r = requests.post(url, data=data, files=files, timeout=1800)
-            finally:
-                for _, fp, *_ in files.values():
-                    try:
-                        fp.close()
-                    except Exception:
-                        pass
-
-        if r.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"MuseTalk failed: {r.text[:1000]}")
-
-        with open(out_mp4, "wb") as f:
-            f.write(r.content)
-
-    return {
-        "ok": True,
-        "url": f"/generated/{out_mp4.name}",
-        "text": text,
-    }
 
 
 @app.post("/api/profile/register_v2")
@@ -1242,7 +1062,7 @@ async def api_profile_register_v2(
         return {
             "ok": True,
             "message": "profile registered",
-            "profile": meta,
+            "profile": build_user_profile(name),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"register_v2 failed: {type(e).__name__}: {e}")
@@ -1254,7 +1074,7 @@ def api_profile_info(user_name: str = Query(...)):
         meta = read_user_meta(user_name)
         if not meta:
             return {"ok": False, "exists": False}
-        return {"ok": True, "exists": True, "profile": meta}
+        return {"ok": True, "exists": True, "profile": build_user_profile(user_name)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"profile info failed: {type(e).__name__}: {e}")
 
@@ -1317,11 +1137,6 @@ def api_standard_video_build(req: BuildStandardVideoRequest):
         if not demo_video_paths:
             raise HTTPException(status_code=404, detail=f"no demo videos found for action={action}")
 
-        print(f"[standard_video/build] user={user_name}, action={action}, force={force}")
-        print(f"[standard_video/build] demo_video_count={len(demo_video_paths)}")
-        for idx, p in enumerate(demo_video_paths, 1):
-            print(f"[standard_video/build] demo[{idx}] = {p}")
-
         out_dir = get_user_standard_action_dir(user_name, action)
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1330,8 +1145,8 @@ def api_standard_video_build(req: BuildStandardVideoRequest):
                 if _is_video_file(old):
                     try:
                         old.unlink()
-                    except Exception as e:
-                        print(f"[standard_video/build] remove old file failed: {old} -> {e}")
+                    except Exception:
+                        pass
 
         results = []
         errors = []
@@ -1341,10 +1156,7 @@ def api_standard_video_build(req: BuildStandardVideoRequest):
             out_name = f"{i:03d}_mimicmotion_{demo_id}.mp4"
             out_path = get_user_generated_standard_path(user_name, action, out_name)
 
-            print(f"[standard_video/build] start {i}/{len(demo_video_paths)} -> demo_id={demo_id}, out={out_path.name}")
-
             if out_path.exists() and not force:
-                print(f"[standard_video/build] skip cached -> {out_path.name}")
                 results.append({
                     "id": demo_id,
                     "source_demo_video_url": get_demo_action_video_public_url(action, demo_video_path),
@@ -1366,22 +1178,17 @@ def api_standard_video_build(req: BuildStandardVideoRequest):
                 with open(out_path, "wb") as f:
                     f.write(content)
 
-                print(f"[standard_video/build] success -> {out_path.name}, bytes={out_path.stat().st_size}")
-
                 results.append({
                     "id": demo_id,
                     "source_demo_video_url": get_demo_action_video_public_url(action, demo_video_path),
                     "cached": False,
                     **build_generated_standard_item(user_name, action, out_path),
                 })
-
             except Exception as e:
-                err_msg = f"{type(e).__name__}: {e}"
-                print(f"[standard_video/build] failed -> demo_id={demo_id}, error={err_msg}")
                 errors.append({
                     "id": demo_id,
                     "file_name": demo_video_path.name,
-                    "error": err_msg,
+                    "error": f"{type(e).__name__}: {e}",
                 })
 
         meta = read_user_meta(user_name)
@@ -1418,50 +1225,254 @@ def api_standard_video_build(req: BuildStandardVideoRequest):
         raise HTTPException(status_code=500, detail=f"standard_video build failed: {type(e).__name__}: {e}")
 
 
-@app.get("/api/actions")
-def api_actions():
+@app.post("/api/evaluate")
+def api_evaluate(req: EvalRequest) -> Dict[str, Any]:
     try:
-        if not DEMO_ACTION_DIR.exists():
-            return {"ok": True, "actions": []}
-
-        action_map: Dict[str, Dict[str, Any]] = {}
-
-        for p in sorted(DEMO_ACTION_DIR.glob("*.mp4")):
-            action_map[p.stem] = {
-                "action": p.stem,
-                "video_count": 1,
-                "cover_video_url": f"/demo_action/{p.name}",
-                "videos": [
-                    {
-                        "id": p.stem,
-                        "file_name": p.name,
-                        "video_url": f"/demo_action/{p.name}",
-                    }
-                ],
-            }
-
-        for d in sorted(DEMO_ACTION_DIR.iterdir()):
-            if not d.is_dir():
-                continue
-            vids = [p for p in sorted(d.iterdir()) if _is_video_file(p)]
-            if not vids:
-                continue
-
-            action_map[d.name] = {
-                "action": d.name,
-                "video_count": len(vids),
-                "cover_video_url": f"/demo_action/{d.name}/{vids[0].name}",
-                "videos": [
-                    {
-                        "id": p.stem,
-                        "file_name": p.name,
-                        "video_url": f"/demo_action/{d.name}/{p.name}",
-                    }
-                    for p in vids
-                ],
-            }
-
-        actions = list(action_map.values())
-        return {"ok": True, "actions": actions}
+        return run_evaluate_core(req)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"list actions failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Server error: {type(e).__name__}: {e}")
+
+
+@app.post("/api/confirm")
+def api_confirm_post(req: ConfirmRequest) -> Dict[str, Any]:
+    try:
+        if req.frames is not None and len(req.frames) < 3:
+            raise HTTPException(status_code=400, detail="Too few valid frames (<3).")
+
+        if req.standard_images and req.user_images:
+            std_imgs = (req.standard_images or [])[:6]
+            usr_imgs = (req.user_images or [])[:6]
+
+            save_info = save_compare_keyframes(
+                action=req.action,
+                standard_images=std_imgs,
+                user_images=usr_imgs,
+            )
+
+            llm_out = llm_confirm_judge_by_images(
+                action=req.action,
+                standard_images=std_imgs,
+                user_images=usr_imgs,
+                eval_result=req.eval_result,
+            )
+
+            try:
+                save_json_file(Path(save_info["session_dir"]) / "llm_result.json", llm_out)
+            except Exception:
+                pass
+
+            return {
+                "action": req.action,
+                "confirm_mode": "vision_keyframes",
+                "llm_confirm": llm_out,
+                "saved_frames": {
+                    "session_dir": save_info["session_dir"],
+                    "saved_standard_count": save_info["saved_standard_count"],
+                    "saved_user_count": save_info["saved_user_count"],
+                },
+            }
+
+        llm_out = llm_confirm_judge(req.action, req.eval_result or {})
+        return {
+            "action": req.action,
+            "confirm_mode": "json_eval",
+            "llm_confirm": llm_out,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM confirm POST failed: {type(e).__name__}: {e}")
+
+
+@app.post("/api/coach_video_v2")
+def api_coach_video_v2(req: CoachVideoRequest) -> Dict[str, Any]:
+    if not req.text.strip():
+        raise HTTPException(status_code=422, detail="text is empty")
+
+    try:
+        url = generate_musetalk_feedback_video(
+            user_name=req.user_name,
+            text=req.text,
+            version=req.version or "v1.5",
+            mode=req.mode or "normal",
+        )
+        return {
+            "ok": True,
+            "url": url,
+            "text": req.text,
+            "user_name": req.user_name,
+            "template_video": str(get_user_video_path(req.user_name)),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"coach_video_v2 failed: {type(e).__name__}: {e}")
+
+
+@app.get("/api/training/plan/get")
+def api_training_plan_get(name: str, action: str, video_id: str) -> Dict[str, Any]:
+    try:
+        plan = load_train_plan(name, action, video_id)
+        return {
+            "ok": True,
+            "user_name": name,
+            "action": action,
+            "video_id": video_id,
+            "train_plan": plan,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"training plan get failed: {type(e).__name__}: {e}")
+
+
+@app.post("/api/training/plan/reset")
+def api_training_plan_reset(req: TrainPlanResetRequest) -> Dict[str, Any]:
+    try:
+        plan = default_train_plan()
+        save_train_plan(req.user_name, req.action, req.video_id, plan)
+        return {
+            "ok": True,
+            "user_name": req.user_name,
+            "action": req.action,
+            "video_id": req.video_id,
+            "train_plan": plan,
+            "message": "当前视频训练计划已重置为第1轮",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"training plan reset failed: {type(e).__name__}: {e}")
+
+
+@app.post("/api/training/plan/update")
+def api_training_plan_update(req: TrainPlanUpdateRequest) -> Dict[str, Any]:
+    try:
+        plan = load_train_plan(req.user_name, req.action, req.video_id)
+
+        round_id = int(plan.get("current_round", 1))
+        max_rounds = int(plan.get("max_rounds", 4))
+
+        if round_id > max_rounds or bool(plan.get("is_finished", False)):
+            plan["is_finished"] = True
+            save_train_plan(req.user_name, req.action, req.video_id, plan)
+            return {
+                "ok": True,
+                "user_name": req.user_name,
+                "action": req.action,
+                "video_id": req.video_id,
+                "message": "该视频训练已达到最大轮次，不再继续更新。",
+                "round_finished": max_rounds,
+                "train_plan": plan,
+            }
+
+        eval_result = req.eval_result or {}
+        llm_confirm = req.llm_confirm or {}
+
+        accuracy = float(eval_result.get("accuracy", 0.0))
+        joint_errors = eval_result.get("joint_errors", {}) or {}
+
+        overall_error = eval_result.get("overall_error", None)
+        if overall_error is None:
+            overall_error = compute_overall_error_from_joint_errors(
+                joint_errors,
+                joint_weights=plan.get("joint_weights", {"shoulder": 0.7, "elbow": 0.3}),
+            )
+        overall_error = float(overall_error)
+
+        normalized_error_value = eval_result.get("normalized_error", None)
+        if normalized_error_value is None:
+            normalized_error_value = normalize_error(overall_error, 0.0, 40.0)
+        normalized_error_value = float(normalized_error_value)
+
+        current_target = float(plan.get("current_target", 0.75))
+        current_threshold = float(plan.get("current_threshold", 15.0))
+
+        pass_flag = int(
+            (accuracy >= current_target) and (overall_error <= current_threshold)
+        )
+
+        if llm_confirm.get("is_pass") is True:
+            pass_flag = max(pass_flag, 1)
+
+        key_issues = llm_confirm.get("key_issues", []) or []
+        if not isinstance(key_issues, list):
+            key_issues = []
+        key_issue_count = len(key_issues)
+
+        state_value = compute_training_state(
+            accuracy=accuracy,
+            normalized_error_value=normalized_error_value,
+            pass_flag=pass_flag,
+            key_issue_count=key_issue_count,
+            alpha=float(plan.get("alpha", 0.40)),
+            beta=float(plan.get("beta", 0.25)),
+            gamma=float(plan.get("gamma", 0.25)),
+            delta=float(plan.get("delta", 0.10)),
+        )
+
+        updated = update_goal_and_threshold(
+            current_target=current_target,
+            current_threshold=current_threshold,
+            state_value=state_value,
+            base_value=float(plan.get("base_value", 0.50)),
+            goal_step=float(plan.get("goal_step", 0.08)),
+            threshold_step=float(plan.get("threshold_step", 3.0)),
+            target_min=float(plan.get("target_min", 0.60)),
+            target_max=float(plan.get("target_max", 0.95)),
+            threshold_min=float(plan.get("threshold_min", 5.0)),
+            threshold_max=float(plan.get("threshold_max", 30.0)),
+        )
+
+        history_item = {
+            "round": round_id,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "action": req.action,
+            "video_id": req.video_id,
+            "score": float(eval_result.get("score", 0.0)),
+            "score_level": str(eval_result.get("score_level", "")),
+            "accuracy": accuracy,
+            "joint_errors": joint_errors,
+            "overall_error": overall_error,
+            "normalized_error": normalized_error_value,
+            "pass_flag": pass_flag,
+            "key_issue_count": key_issue_count,
+            "key_issues": key_issues,
+            "state_value": state_value,
+            "current_target": current_target,
+            "current_threshold": current_threshold,
+            "next_target": updated["next_target"],
+            "next_threshold": updated["next_threshold"],
+        }
+
+        history = plan.get("history", [])
+        if not isinstance(history, list):
+            history = []
+        history.append(history_item)
+
+        plan["history"] = history
+        plan["current_round"] = round_id + 1
+        plan["current_target"] = updated["next_target"]
+        plan["current_threshold"] = updated["next_threshold"]
+        plan["is_finished"] = int(plan["current_round"]) > max_rounds
+
+        save_train_plan(req.user_name, req.action, req.video_id, plan)
+
+        return {
+            "ok": True,
+            "user_name": req.user_name,
+            "action": req.action,
+            "video_id": req.video_id,
+            "round_finished": round_id,
+            "accuracy": accuracy,
+            "overall_error": overall_error,
+            "normalized_error": normalized_error_value,
+            "pass_flag": pass_flag,
+            "key_issue_count": key_issue_count,
+            "state_value": state_value,
+            "current_target": current_target,
+            "current_threshold": current_threshold,
+            "next_target": updated["next_target"],
+            "next_threshold": updated["next_threshold"],
+            "train_plan": plan,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"training plan update failed: {type(e).__name__}: {e}")

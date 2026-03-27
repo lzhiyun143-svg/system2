@@ -1,0 +1,120 @@
+{
+  "current_round": 5,
+  "max_rounds": 4,
+  "current_target": 0.6,
+  "current_threshold": 21.446054114269643,
+  "target_min": 0.6,
+  "target_max": 0.95,
+  "threshold_min": 5.0,
+  "threshold_max": 30.0,
+  "goal_step": 0.08,
+  "threshold_step": 3.0,
+  "alpha": 0.4,
+  "beta": 0.25,
+  "gamma": 0.25,
+  "delta": 0.1,
+  "base_value": 0.5,
+  "joint_weights": {
+    "shoulder": 0.7,
+    "elbow": 0.3
+  },
+  "history": [
+    {
+      "round": 1,
+      "timestamp": "2026-03-26T10:28:48",
+      "action": "raise_arm",
+      "accuracy": 0.002360140374175544,
+      "joint_errors": {
+        "shoulder": 0.1837562881573861,
+        "elbow": 0.5803544488844747
+      },
+      "overall_error": 0.30273573637551265,
+      "normalized_error": 0.007568393409387817,
+      "pass_flag": 0,
+      "key_issue_count": 3,
+      "key_issues": [
+        "肩部抬举幅度明显不足，未达到标准高度。",
+        "动作全程无明显抬臂动作，核心为静态姿势。",
+        "左右对称性无法评估，因动作未完成。"
+      ],
+      "state_value": -0.05094804220267679,
+      "current_target": 0.75,
+      "current_threshold": 15.0,
+      "next_target": 0.7059241566237858,
+      "next_threshold": 16.65284412660803
+    },
+    {
+      "round": 2,
+      "timestamp": "2026-03-26T13:05:37",
+      "action": "raise_arm",
+      "accuracy": 0.05421256070786619,
+      "joint_errors": {
+        "shoulder": 0.03037882149774155,
+        "elbow": 0.4898897303313168
+      },
+      "overall_error": 0.1682320941478141,
+      "normalized_error": 0.004205802353695352,
+      "pass_flag": 0,
+      "key_issue_count": 3,
+      "key_issues": [
+        "动作幅度明显小于标准，抬臂高度不足",
+        "肘部姿态不稳定，有轻微代偿现象",
+        "动作节奏较慢，时序一致性欠佳"
+      ],
+      "state_value": -0.029366426305277415,
+      "current_target": 0.7059241566237858,
+      "current_threshold": 16.65284412660803,
+      "next_target": 0.6635748425193636,
+      "next_threshold": 18.240943405523865
+    },
+    {
+      "round": 3,
+      "timestamp": "2026-03-26T13:10:12",
+      "action": "raise_arm",
+      "accuracy": 0.05622206673905134,
+      "joint_errors": {
+        "shoulder": 0.013029698989468892,
+        "elbow": 0.48475575725625497
+      },
+      "overall_error": 0.1545475164695047,
+      "normalized_error": 0.003863687911737618,
+      "pass_flag": 0,
+      "key_issue_count": 3,
+      "key_issues": [
+        "动作幅度明显不足，未达到标准高度",
+        "肘部姿态不稳定，存在代偿现象",
+        "左右对称性较差，右侧动作略显僵硬"
+      ],
+      "state_value": -0.028477095282313902,
+      "current_target": 0.6635748425193636,
+      "current_threshold": 18.240943405523865,
+      "next_target": 0.6212966748967785,
+      "next_threshold": 19.826374691370805
+    },
+    {
+      "round": 4,
+      "timestamp": "2026-03-26T13:14:19",
+      "action": "raise_arm",
+      "accuracy": 0.027976287948759136,
+      "joint_errors": {
+        "shoulder": 0.03204557524585432,
+        "elbow": 0.5031769355105912
+      },
+      "overall_error": 0.17338498332527535,
+      "normalized_error": 0.0043346245831318835,
+      "pass_flag": 0,
+      "key_issue_count": 3,
+      "key_issues": [
+        "动作幅度明显不足，未达到标准高度",
+        "肘部姿态不稳定，存在代偿现象",
+        "左右对称性较差，动作不均衡"
+      ],
+      "state_value": -0.03989314096627933,
+      "current_target": 0.6212966748967785,
+      "current_threshold": 19.826374691370805,
+      "next_target": 0.6,
+      "next_threshold": 21.446054114269643
+    }
+  ],
+  "is_finished": true
+}

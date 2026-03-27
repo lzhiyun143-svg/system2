@@ -15,8 +15,6 @@ type FramePayload = {
   right_hand: number[][];
 };
 
-type EvalAutoResponse = any;
-
 type ProfileState = {
   ok?: boolean;
   exists?: boolean;
@@ -38,11 +36,23 @@ type StandardVideoItem = {
   cached?: boolean;
 };
 
+type TrainPlan = {
+  current_round?: number;
+  max_rounds?: number;
+  current_target?: number;
+  current_threshold?: number;
+  is_finished?: boolean;
+  history?: any[];
+};
+
 const FIXED_ACTION: ActionName = "raise_arm";
 
 const DEFAULT_TARGET_DURATION_MS = 3000;
 const SAMPLE_INTERVAL_MS = 33;
 const EVAL_TIMEOUT_MS = 120_000;
+const CONFIRM_TIMEOUT_MS = 120_000;
+const COACH_VIDEO_TIMEOUT_MS = 420_000;
+const PLAN_TIMEOUT_MS = 60_000;
 
 const MP_WASM_BASE =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm";
@@ -53,7 +63,13 @@ const HAND_TASK_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
 const API_BASE = "http://127.0.0.1:8000";
-const EVAL_AUTO_API = `${API_BASE}/api/evaluate_auto`;
+const EVAL_API = `${API_BASE}/api/evaluate`;
+const CONFIRM_API = `${API_BASE}/api/confirm`;
+const COACH_VIDEO_V2_API = `${API_BASE}/api/coach_video_v2`;
+const TRAIN_PLAN_GET_API = `${API_BASE}/api/training/plan/get`;
+const TRAIN_PLAN_UPDATE_API = `${API_BASE}/api/training/plan/update`;
+const TRAIN_PLAN_RESET_API = `${API_BASE}/api/training/plan/reset`;
+
 const PROFILE_CHECK_API = `${API_BASE}/api/profile/check`;
 const PROFILE_REGISTER_V2_API = `${API_BASE}/api/profile/register_v2`;
 const STANDARD_INFO_API = `${API_BASE}/api/standard_video/info`;
@@ -69,7 +85,11 @@ function joinApiUrl(path?: string | null) {
   return `${API_BASE}${path}`;
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number) {
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number
+) {
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -129,19 +149,81 @@ function getScoreInfo(result: any) {
     result?.final_score,
     result?.total_score,
     result?.overall_score,
+
+    result?.evaluate?.score,
+    result?.evaluate?.final_score,
+    result?.evaluate?.total_score,
+    result?.evaluate?.overall_score,
+
     result?.result?.score,
   ];
 
-  const found = candidates.find((x) => typeof x === "number" && Number.isFinite(x));
-  const score = typeof found === "number" ? Math.max(0, Math.min(100, found)) : null;
+  const found = candidates.find(
+    (x) => typeof x === "number" && Number.isFinite(x)
+  );
+
+  const score =
+    typeof found === "number" ? Math.max(0, Math.min(100, found)) : null;
+
+  const level =
+    result?.score_level ||
+    result?.evaluate?.score_level ||
+    (score == null
+      ? "待评估"
+      : score >= 85
+      ? "优秀"
+      : score >= 70
+      ? "良好"
+      : score >= 60
+      ? "合格"
+      : "待提升");
 
   if (score == null) {
     return { score: "--", percent: 0, level: "待评估" };
   }
-  if (score >= 85) return { score: `${score.toFixed(0)}`, percent: score, level: "优秀" };
-  if (score >= 70) return { score: `${score.toFixed(0)}`, percent: score, level: "良好" };
-  if (score >= 60) return { score: `${score.toFixed(0)}`, percent: score, level: "合格" };
-  return { score: `${score.toFixed(0)}`, percent: score, level: "待提升" };
+
+  return {
+    score: `${score.toFixed(0)}`,
+    percent: score,
+    level,
+  };
+}
+
+function buildCoachTextFromConfirm(confirmResp: any, evaluateResp?: any) {
+  const llm = confirmResp?.llm_confirm || confirmResp?.confirm?.llm_confirm || {};
+  const overall = String(llm?.overall || "").trim();
+  const keyIssues = Array.isArray(llm?.key_issues) ? llm.key_issues : [];
+  const tips = Array.isArray(llm?.tips) ? llm.tips : [];
+
+  const lines: string[] = [];
+
+  if (overall) {
+    lines.push(`本次动作评估结果：${overall}`);
+  } else if (evaluateResp?.llm_feedback) {
+    lines.push(String(evaluateResp.llm_feedback));
+  }
+
+  const cleanIssues = keyIssues
+    .map((x: any) => String(x || "").trim())
+    .filter(Boolean)
+    .slice(0, 3);
+  const cleanTips = tips
+    .map((x: any) => String(x || "").trim())
+    .filter(Boolean)
+    .slice(0, 3);
+
+  if (cleanIssues.length > 0) {
+    lines.push(`主要问题有：${cleanIssues.join("；")}。`);
+  }
+  if (cleanTips.length > 0) {
+    lines.push(`建议你这样调整：${cleanTips.join("；")}。`);
+  }
+
+  if (lines.length === 0) {
+    lines.push("本次动作已完成评估。请继续保持动作稳定，注意幅度和节奏一致。");
+  }
+
+  return lines.join("\n");
 }
 
 function formatMpStatus(status: "idle" | "loading" | "ready" | "error") {
@@ -217,13 +299,20 @@ function RehabMain({ userName }: { userName: string }) {
   const [handsDetected, setHandsDetected] = useState(false);
 
   const [framesBuffered, setFramesBuffered] = useState(0);
-  const [isEvaluating, setIsEvaluating] = useState(false);
 
-  const [result, setResult] = useState<EvalAutoResponse | null>(null);
+  const [isEvaluating, setIsEvaluating] = useState(false);
+  const [isConfirming, setIsConfirming] = useState(false);
+  const [isUpdatingPlan, setIsUpdatingPlan] = useState(false);
+  const [isGeneratingCoach, setIsGeneratingCoach] = useState(false);
+
+  const [result, setResult] = useState<any | null>(null);
+  const [confirmResult, setConfirmResult] = useState<any | null>(null);
   const [evalError, setEvalError] = useState<string>("");
 
   const [feedbackText, setFeedbackText] = useState<string>("");
   const [coachVideoUrl, setCoachVideoUrl] = useState<string>("");
+
+  const [trainPlan, setTrainPlan] = useState<TrainPlan | null>(null);
 
   const [stdVideoList, setStdVideoList] = useState<StandardVideoItem[]>([]);
   const [selectedStdVideoUrl, setSelectedStdVideoUrl] = useState<string | null>(null);
@@ -239,6 +328,9 @@ function RehabMain({ userName }: { userName: string }) {
 
   const [stdVideoAspect, setStdVideoAspect] = useState<number>(16 / 9);
   const [userVideoAspect, setUserVideoAspect] = useState<number>(16 / 9);
+
+  const [standardReady, setStandardReady] = useState<boolean>(false);
+  const [captureDone, setCaptureDone] = useState<boolean>(false);
 
   const userVideoRef = useRef<HTMLVideoElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
@@ -270,7 +362,18 @@ function RehabMain({ userName }: { userName: string }) {
     return selectedStdVideoUrl || "";
   }, [selectedStdVideoUrl]);
 
+  const currentVideoId = useMemo(() => {
+    const item = stdVideoList.find((x) => (x.video_url || "") === activeStandardVideoSrc);
+    if (item?.id) return String(item.id);
+    if (item?.file_name) return String(item.file_name);
+    return "default";
+  }, [stdVideoList, activeStandardVideoSrc]);
+
   const scoreInfo = useMemo(() => getScoreInfo(result), [result]);
+
+  const currentRound = trainPlan?.current_round ?? 1;
+  const maxRounds = trainPlan?.max_rounds ?? 4;
+  const isPlanFinished = Boolean(trainPlan?.is_finished) || currentRound > maxRounds;
 
   useEffect(() => {
     let cancelled = false;
@@ -347,10 +450,36 @@ function RehabMain({ userName }: { userName: string }) {
     };
   }, []);
 
+  async function loadTrainPlan(videoId: string) {
+    try {
+      const resp = await fetchWithTimeout(
+        `${TRAIN_PLAN_GET_API}?name=${encodeURIComponent(userName)}&action=${encodeURIComponent(action)}&video_id=${encodeURIComponent(videoId)}`,
+        { method: "GET" },
+        PLAN_TIMEOUT_MS
+      );
+      const text = await resp.text();
+      if (!resp.ok) throw new Error(text || `HTTP ${resp.status}`);
+      const parsed = JSON.parse(text);
+      setTrainPlan(parsed?.train_plan || null);
+    } catch (e: any) {
+      console.error("loadTrainPlan failed", e);
+    }
+  }
+
+  useEffect(() => {
+    if (userName && currentVideoId) {
+      loadTrainPlan(currentVideoId);
+    }
+  }, [userName, action, currentVideoId]);
+
   async function ensureUserStandardVideo(currentUserName: string, currentAction: string) {
     try {
       setBuildingStandard(true);
       setStatusText("正在检查个性化标准动作视频...");
+      setStandardReady(false);
+      standardReadyRef.current = false;
+      standardSeqRef.current = [];
+      stdKeyframesRef.current = [];
 
       const infoResp = await fetch(
         `${STANDARD_INFO_API}?user_name=${encodeURIComponent(
@@ -373,14 +502,14 @@ function RehabMain({ userName }: { userName: string }) {
           .filter((x) => !!x.fullUrl);
 
         if (urls.length > 0) {
-          setStdVideoList(
-            urls.map((x) => ({
-              ...x,
-              video_url: x.fullUrl,
-            }))
-          );
-          setSelectedStdVideoUrl(urls[0].fullUrl);
-          setStatusText(`已加载个性化标准动作视频（${urls.length}个）`);
+          const normalized = urls.map((x, idx) => ({
+            ...x,
+            id: x.id || `std_${idx + 1}`,
+            video_url: x.fullUrl,
+          }));
+          setStdVideoList(normalized);
+          setSelectedStdVideoUrl(normalized[0].video_url || null);
+          setStatusText(`已加载个性化标准动作视频（${normalized.length}个）`);
           return;
         }
       }
@@ -403,21 +532,21 @@ function RehabMain({ userName }: { userName: string }) {
 
       const builtItems = normalizeStandardItemsFromBuild(buildData);
       const urls = builtItems
-        .map((x) => ({
+        .map((x, idx) => ({
           ...x,
+          id: x.id || `std_${idx + 1}`,
           fullUrl: joinApiUrl(x.video_url || ""),
         }))
         .filter((x) => !!x.fullUrl);
 
       if (urls.length > 0) {
-        setStdVideoList(
-          urls.map((x) => ({
-            ...x,
-            video_url: x.fullUrl,
-          }))
-        );
-        setSelectedStdVideoUrl(urls[0].fullUrl);
-        setStatusText(`个性化标准动作视频生成完成（${urls.length}个）`);
+        const normalized = urls.map((x) => ({
+          ...x,
+          video_url: x.fullUrl,
+        }));
+        setStdVideoList(normalized);
+        setSelectedStdVideoUrl(normalized[0].video_url || null);
+        setStatusText(`个性化标准动作视频生成完成（${normalized.length}个）`);
       } else {
         setStdVideoList([]);
         setSelectedStdVideoUrl(null);
@@ -428,6 +557,10 @@ function RehabMain({ userName }: { userName: string }) {
       setStdVideoList([]);
       setSelectedStdVideoUrl(null);
       setStatusText(`标准视频生成失败：${e?.message || e}`);
+      setStandardReady(false);
+      standardReadyRef.current = false;
+      standardSeqRef.current = [];
+      stdKeyframesRef.current = [];
     } finally {
       setBuildingStandard(false);
     }
@@ -464,6 +597,7 @@ function RehabMain({ userName }: { userName: string }) {
 
   async function buildStandardSequence() {
     standardReadyRef.current = false;
+    setStandardReady(false);
     standardSeqRef.current = [];
     stdKeyframesRef.current = [];
 
@@ -545,12 +679,22 @@ function RehabMain({ userName }: { userName: string }) {
 
     standardSeqRef.current = seq;
     standardReadyRef.current = seq.length >= 3;
+    setStandardReady(seq.length >= 3);
+
+    if (seq.length >= 3) {
+      setStatusText(
+        `标准动作骨架已准备完成（骨架帧 ${seq.length}，关键帧 ${stdKeyframesRef.current.length}）`
+      );
+    } else {
+      setStatusText("标准视频已加载，但骨架提取不足，暂不可评估。");
+    }
   }
 
   useEffect(() => {
     if (mpStatus !== "ready") return;
     if (!activeStandardVideoSrc) {
       standardReadyRef.current = false;
+      setStandardReady(false);
       standardSeqRef.current = [];
       stdKeyframesRef.current = [];
       return;
@@ -558,17 +702,22 @@ function RehabMain({ userName }: { userName: string }) {
 
     buildStandardSequence().catch(() => {
       standardReadyRef.current = false;
+      setStandardReady(false);
       standardSeqRef.current = [];
+      stdKeyframesRef.current = [];
     });
   }, [mpStatus, action, activeStandardVideoSrc]);
 
   async function startCamera() {
     setEvalError("");
     setResult(null);
+    setConfirmResult(null);
     setFeedbackText("");
     setCoachVideoUrl("");
     setTrainFinished(false);
     setTrainHint("");
+    setCaptureDone(false);
+    captureDoneRef.current = false;
 
     const video = userVideoRef.current;
     if (!video) return;
@@ -591,7 +740,6 @@ function RehabMain({ userName }: { userName: string }) {
       setFramesBuffered(0);
       lastSampleTsRef.current = 0;
       captureStartTsRef.current = null;
-      captureDoneRef.current = false;
       userKeyframesRef.current = [];
 
       const stdPlayer = stdPlayerRef.current;
@@ -621,7 +769,10 @@ function RehabMain({ userName }: { userName: string }) {
     lastSampleTsRef.current = 0;
     captureStartTsRef.current = null;
     captureDoneRef.current = false;
+    setCaptureDone(false);
     userKeyframesRef.current = [];
+    setTrainFinished(false);
+    setTrainHint("");
 
     if (rafRef.current != null) {
       cancelAnimationFrame(rafRef.current);
@@ -669,8 +820,7 @@ function RehabMain({ userName }: { userName: string }) {
 
       const poseRes = poseLm.detectForVideo(video, ts);
       const posePts = poseRes.landmarks?.[0] ?? null;
-      const hasPose = !!posePts;
-      setPoseDetected(hasPose);
+      setPoseDetected(!!posePts);
 
       const handRes = handLm.detectForVideo(video, ts);
       const hasHands = !!(handRes.landmarks && handRes.landmarks.length > 0);
@@ -733,6 +883,14 @@ function RehabMain({ userName }: { userName: string }) {
       const elapsed = ts - captureStartTsRef.current;
       if (elapsed >= currentTrainDurationMs) {
         captureDoneRef.current = true;
+        setCaptureDone(true);
+        setTrainFinished(true);
+
+        if (isPlanFinished) {
+          setTrainHint("该视频已完成 4 轮训练。");
+        } else {
+          setTrainHint("本轮训练完成，请点击“开始评估”获取结果。");
+        }
         return;
       }
 
@@ -767,12 +925,18 @@ function RehabMain({ userName }: { userName: string }) {
   async function evaluateAuto() {
     setEvalError("");
     setResult(null);
+    setConfirmResult(null);
     setFeedbackText("");
     setCoachVideoUrl("");
 
-    if (isEvaluating) return;
+    if (isEvaluating || isConfirming || isUpdatingPlan || isGeneratingCoach) return;
 
-    if (!captureDoneRef.current) {
+    if (isPlanFinished) {
+      setEvalError("该视频训练已完成 4 轮，不再继续训练。");
+      return;
+    }
+
+    if (!captureDone) {
       setEvalError(
         `当前训练尚未完成，请先跟随左侧视频训练完毕（约 ${(currentTrainDurationMs / 1000).toFixed(1)} 秒）`
       );
@@ -785,8 +949,8 @@ function RehabMain({ userName }: { userName: string }) {
       return;
     }
 
-    if (!standardReadyRef.current || !standardSeqRef.current.length) {
-      setEvalError("当前还没有可用的标准视频骨架序列，请先等待生成完成。");
+    if (!standardSeqRef.current.length) {
+      setEvalError("当前还没有可用的标准视频骨架序列，请先等待标准视频准备完成。");
       return;
     }
 
@@ -802,71 +966,203 @@ function RehabMain({ userName }: { userName: string }) {
       return;
     }
 
-    setIsEvaluating(true);
-    setStatusText("正在评估动作并生成反馈...");
+    const evalPayload = {
+      action,
+      frames,
+      user_seq: frames,
+      standard_seq: standardSeqRef.current,
+      use_llm: true,
+    };
 
     try {
-      const payload: any = {
-        action,
-        user_name: userName,
-        frames,
-        user_seq: frames,
-        standard_seq: standardSeqRef.current,
-        standard_images: stdImgs,
-        user_images: usrImgs,
-        use_llm: true,
-      };
-
-      const resp = await fetchWithTimeout(
-        EVAL_AUTO_API,
+      setIsEvaluating(true);
+      setStatusText(`第 ${currentRound}/${maxRounds} 轮：正在进行动作评分...`);
+      const evalResp = await fetchWithTimeout(
+        EVAL_API,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
+          body: JSON.stringify(evalPayload),
         },
         EVAL_TIMEOUT_MS
       );
 
-      const text = await resp.text();
-      if (!resp.ok) {
-        setEvalError(`HTTP ${resp.status}:\n${text}`);
+      const evalText = await evalResp.text();
+      if (!evalResp.ok) {
+        setEvalError(`动作评分失败（HTTP ${evalResp.status}）:\n${evalText}`);
         return;
       }
 
-      let parsed: any = null;
+      let evalParsed: any = null;
       try {
-        parsed = JSON.parse(text);
+        evalParsed = JSON.parse(evalText);
       } catch {
-        parsed = { raw: text };
+        evalParsed = { raw: evalText };
       }
 
-      setResult(parsed);
-      setFeedbackText(parsed?.feedback_text || "");
-      setCoachVideoUrl(joinApiUrl(parsed?.coach_video_url || ""));
+      setResult(evalParsed);
+      setIsEvaluating(false);
 
-      setStatusText("评估完成");
+      setIsConfirming(true);
+      setStatusText(`第 ${currentRound}/${maxRounds} 轮：正在生成文字反馈...`);
+
+      const confirmPayload = {
+        action,
+        frames,
+        standard_seq: standardSeqRef.current,
+        eval_result: evalParsed,
+        standard_images: stdImgs,
+        user_images: usrImgs,
+      };
+
+      const confirmResp = await fetchWithTimeout(
+        CONFIRM_API,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(confirmPayload),
+        },
+        CONFIRM_TIMEOUT_MS
+      );
+
+      const confirmText = await confirmResp.text();
+      if (!confirmResp.ok) {
+        setEvalError(`文字反馈生成失败（HTTP ${confirmResp.status}）:\n${confirmText}`);
+        return;
+      }
+
+      let confirmParsed: any = null;
+      try {
+        confirmParsed = JSON.parse(confirmText);
+      } catch {
+        confirmParsed = { raw: confirmText };
+      }
+
+      setConfirmResult(confirmParsed);
+
+      const coachText = buildCoachTextFromConfirm(confirmParsed, evalParsed);
+      setFeedbackText(coachText);
+      setIsConfirming(false);
+
+      setIsUpdatingPlan(true);
+      setStatusText(`第 ${currentRound}/${maxRounds} 轮：正在更新下一轮训练目标与阈值...`);
+
+      const llmConfirmObj =
+        confirmParsed?.llm_confirm || confirmParsed?.confirm?.llm_confirm || {};
+
+      const planResp = await fetchWithTimeout(
+        TRAIN_PLAN_UPDATE_API,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            user_name: userName,
+            action,
+            video_id: currentVideoId,
+            eval_result: evalParsed,
+            llm_confirm: llmConfirmObj,
+          }),
+        },
+        PLAN_TIMEOUT_MS
+      );
+
+      const planText = await planResp.text();
+      if (!planResp.ok) {
+        setEvalError(`训练计划更新失败（HTTP ${planResp.status}）:\n${planText}`);
+        return;
+      }
+
+      let planParsed: any = null;
+      try {
+        planParsed = JSON.parse(planText);
+      } catch {
+        planParsed = { raw: planText };
+      }
+
+      if (planParsed?.train_plan) {
+        setTrainPlan(planParsed.train_plan);
+      } else {
+        await loadTrainPlan(currentVideoId);
+      }
+
+      setIsUpdatingPlan(false);
+
+      setIsGeneratingCoach(true);
+      setStatusText(`第 ${currentRound}/${maxRounds} 轮：正在生成数字人视频...`);
+
+      const coachResp = await fetchWithTimeout(
+        COACH_VIDEO_V2_API,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            user_name: userName,
+            text: coachText,
+            version: "v1.5",
+            mode: "normal",
+          }),
+        },
+        COACH_VIDEO_TIMEOUT_MS
+      );
+
+      const coachTextResp = await coachResp.text();
+      if (!coachResp.ok) {
+        setEvalError(`数字人视频生成失败（HTTP ${coachResp.status}）:\n${coachTextResp}`);
+        return;
+      }
+
+      let coachParsed: any = null;
+      try {
+        coachParsed = JSON.parse(coachTextResp);
+      } catch {
+        coachParsed = { raw: coachTextResp };
+      }
+
+      setCoachVideoUrl(joinApiUrl(coachParsed?.url || ""));
+
+      if ((planParsed?.train_plan?.is_finished ?? trainPlan?.is_finished) === true) {
+        setStatusText("该视频训练已完成 4 轮。");
+      } else {
+        setStatusText("本轮评估完成，下一轮目标与阈值已更新。");
+      }
+
       setTimeout(() => {
         const el = coachPlayerRef.current;
-        if (el && parsed?.coach_video_url) {
+        if (el && coachParsed?.url) {
           el.currentTime = 0;
           el.play().catch(() => {});
         }
       }, 80);
     } catch (e: any) {
       if (e?.name === "AbortError") {
-        setEvalError(
-          `请求超时（${EVAL_TIMEOUT_MS}ms）\n请确认后端 http://127.0.0.1:8000 正在运行，并且 /api/evaluate_auto 没有阻塞。`
-        );
+        setEvalError("请求超时，请检查后端是否仍在运行。");
       } else {
         setEvalError("请求失败：" + String(e?.message || e));
       }
     } finally {
       setIsEvaluating(false);
+      setIsConfirming(false);
+      setIsUpdatingPlan(false);
+      setIsGeneratingCoach(false);
     }
   }
 
+  const hasUserData =
+    framesRef.current.length >= 3 && userKeyframesRef.current.length >= 2;
+
+  const hasStandardData =
+    standardSeqRef.current.length >= 3 && stdKeyframesRef.current.length >= 2;
+
   const canEvaluate =
-    cameraOn && captureDoneRef.current && !isEvaluating && standardReadyRef.current;
+    cameraOn &&
+    captureDone &&
+    !isEvaluating &&
+    !isConfirming &&
+    !isUpdatingPlan &&
+    !isGeneratingCoach &&
+    hasUserData &&
+    hasStandardData &&
+    !isPlanFinished;
 
   return (
     <div className="rehab-shell">
@@ -902,11 +1198,12 @@ function RehabMain({ userName }: { userName: string }) {
           <div className="hero-kicker">个性化 · 智能化 · 可追踪</div>
           <h1 className="hero-title">面向上肢康复训练的智能辅助系统</h1>
           <p className="hero-desc">
-            基于姿态识别、动作比对、自动评估与数字人反馈，为用户提供更直观、更专业的康复训练体验。
+            基于姿态识别、动作比对、自动评估与数字人反馈，并按不同标准视频分别管理训练轮次。
           </p>
           <div className="hero-tags">
             <StatusBadge text="实时姿态识别" tone="info" />
             <StatusBadge text="自动动作评估" tone="success" />
+            <StatusBadge text="视频切换重置轮次" tone="warn" />
             <StatusBadge text="数字人反馈" tone="default" />
           </div>
         </div>
@@ -914,12 +1211,28 @@ function RehabMain({ userName }: { userName: string }) {
         <div className="hero-stats">
           <StatCard label="当前动作" value={action} sub="固定训练动作" />
           <StatCard
-            label="训练时长"
-            value={`${(currentTrainDurationMs / 1000).toFixed(1)} s`}
-            sub="跟练视频时长"
+            label="训练轮次"
+            value={`${currentRound}/${maxRounds}`}
+            sub={isPlanFinished ? "已完成全部轮次" : "当前视频训练进度"}
           />
-          <StatCard label="评估得分" value={scoreInfo.score} sub={scoreInfo.level} />
-          <StatCard label="采集帧数" value={`${framesBuffered}`} sub="动作关键帧累计" />
+          <StatCard
+            label="训练目标"
+            value={
+              trainPlan?.current_target != null
+                ? `${(trainPlan.current_target * 100).toFixed(0)}%`
+                : "--"
+            }
+            sub="当前达标目标"
+          />
+          <StatCard
+            label="误差阈值"
+            value={
+              trainPlan?.current_threshold != null
+                ? `${Number(trainPlan.current_threshold).toFixed(1)}`
+                : "--"
+            }
+            sub="当前允许误差"
+          />
         </div>
       </section>
 
@@ -930,14 +1243,23 @@ function RehabMain({ userName }: { userName: string }) {
         </div>
       )}
 
+      {isPlanFinished && (
+        <div className="alert-box alert-danger">
+          <div className="alert-title">该视频训练已结束</div>
+          <div className="alert-pre">
+            当前视频已完成 4 轮训练，不再继续调整下一轮训练目标与阈值。
+          </div>
+        </div>
+      )}
+
       <div className="training-grid">
         <SectionCard
           title="标准示范"
           desc="系统将自动加载当前用户对应的个性化标准动作视频。"
           extra={
             <StatusBadge
-              text={standardReadyRef.current ? "标准骨架已就绪" : "标准骨架构建中"}
-              tone={standardReadyRef.current ? "success" : "warn"}
+              text={standardReady ? "标准骨架已就绪" : "标准骨架构建中"}
+              tone={standardReady ? "success" : "warn"}
             />
           }
         >
@@ -972,8 +1294,13 @@ function RehabMain({ userName }: { userName: string }) {
                 }}
                 onEnded={() => {
                   setTrainFinished(true);
-                  setTrainHint("本轮示范播放完成，请点击“开始评估”获取结果。");
+                  if (isPlanFinished) {
+                    setTrainHint("该视频已完成 4 轮训练。");
+                  } else {
+                    setTrainHint("本轮示范播放完成，请点击“开始评估”获取结果。");
+                  }
                   captureDoneRef.current = true;
+                  setCaptureDone(true);
                 }}
                 className="video-element fit-contain"
               />
@@ -986,17 +1313,6 @@ function RehabMain({ userName }: { userName: string }) {
               playsInline
               crossOrigin="anonymous"
               preload="auto"
-              onLoadedMetadata={(e) => {
-                const el = e.currentTarget;
-                const durSec =
-                  el.duration && Number.isFinite(el.duration) ? el.duration : 3;
-                const durMs = Math.max(1000, Math.round(durSec * 1000));
-                setCurrentTrainDurationMs(durMs);
-
-                if (el.videoWidth > 0 && el.videoHeight > 0) {
-                  setStdVideoAspect(el.videoWidth / el.videoHeight);
-                }
-              }}
               style={{ display: "none" }}
             />
 
@@ -1004,15 +1320,9 @@ function RehabMain({ userName }: { userName: string }) {
               <div className="empty-state-mini">当前暂无可播放的个性化标准视频</div>
             )}
 
-            <div className="train-note">
-              {trainFinished
-                ? trainHint || "本轮训练结束，请点击评估。"
-                : "点击“开启摄像头”后，系统将同步进行跟练采集。"}
-            </div>
-
             {stdVideoList.length > 0 && (
               <div className="video-switcher">
-                <div className="switcher-title">可切换的标准视频</div>
+                <div className="switcher-title">标准视频切换</div>
                 <div className="switcher-grid">
                   {stdVideoList.map((item, idx) => {
                     const url = item.video_url || "";
@@ -1020,12 +1330,57 @@ function RehabMain({ userName }: { userName: string }) {
                     return (
                       <button
                         key={`${item.id || idx}_${item.file_name || idx}`}
-                        onClick={() => {
+                        onClick={async () => {
                           setSelectedStdVideoUrl(url);
-                          setStatusText(`已切换到第 ${idx + 1} 个标准视频`);
+                          setStatusText(`已切换到第 ${idx + 1} 个标准视频，正在重置训练轮次...`);
+
                           setTrainFinished(false);
                           setTrainHint("");
                           captureDoneRef.current = false;
+                          setCaptureDone(false);
+
+                          setStandardReady(false);
+                          standardReadyRef.current = false;
+                          standardSeqRef.current = [];
+                          stdKeyframesRef.current = [];
+
+                          framesRef.current = [];
+                          userKeyframesRef.current = [];
+                          setFramesBuffered(0);
+
+                          setResult(null);
+                          setConfirmResult(null);
+                          setFeedbackText("");
+                          setCoachVideoUrl("");
+                          setEvalError("");
+
+                          const nextVideoId = String(item.id || item.file_name || `video_${idx + 1}`);
+
+                          try {
+                            const resp = await fetchWithTimeout(
+                              TRAIN_PLAN_RESET_API,
+                              {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({
+                                  user_name: userName,
+                                  action,
+                                  video_id: nextVideoId,
+                                }),
+                              },
+                              PLAN_TIMEOUT_MS
+                            );
+
+                            const text = await resp.text();
+                            if (!resp.ok) throw new Error(text || `HTTP ${resp.status}`);
+
+                            const parsed = JSON.parse(text);
+                            setTrainPlan(parsed?.train_plan || null);
+                            setStatusText(`已切换到第 ${idx + 1} 个标准视频，并从第1轮重新开始训练`);
+                          } catch (e: any) {
+                            console.error(e);
+                            setStatusText(`视频已切换，但训练轮次重置失败：${e?.message || e}`);
+                          }
                         }}
                         className={`switcher-btn ${active ? "active" : ""}`}
                       >
@@ -1033,7 +1388,7 @@ function RehabMain({ userName }: { userName: string }) {
                           {item.file_name || `video_${idx + 1}.mp4`}
                         </div>
                         <div className="switcher-state">
-                          {item.cached ? "cached" : "generated"}
+                          {active ? "当前使用中" : "点击切换"}
                         </div>
                       </button>
                     );
@@ -1041,6 +1396,12 @@ function RehabMain({ userName }: { userName: string }) {
                 </div>
               </div>
             )}
+
+            <div className="train-note">
+              {trainFinished
+                ? trainHint || "本轮训练结束，请点击评估。"
+                : "点击“开启摄像头”后，系统将同步进行跟练采集。"}
+            </div>
 
             <div className="mini-status-text">
               {buildingStandard ? "标准视频处理中..." : statusText}
@@ -1050,12 +1411,12 @@ function RehabMain({ userName }: { userName: string }) {
 
         <SectionCard
           title="实时训练"
-          desc="跟随左侧标准动作完成训练，系统将自动采集骨架并进行动作评估。"
+          desc="切换标准视频后会自动从第1轮重新开始训练。"
           extra={
             <div className="panel-action-row">
               <button
                 onClick={startCamera}
-                disabled={mpStatus !== "ready" || cameraOn}
+                disabled={mpStatus !== "ready" || cameraOn || isPlanFinished}
                 className="btn btn-primary"
               >
                 开启摄像头
@@ -1072,7 +1433,17 @@ function RehabMain({ userName }: { userName: string }) {
                 disabled={!canEvaluate}
                 className="btn btn-accent"
               >
-                {isEvaluating ? "评估中..." : "开始评估"}
+                {isEvaluating
+                  ? "评分中..."
+                  : isConfirming
+                  ? "文字生成中..."
+                  : isUpdatingPlan
+                  ? "更新计划中..."
+                  : isGeneratingCoach
+                  ? "数字人生成中..."
+                  : isPlanFinished
+                  ? "已完成4轮"
+                  : "开始评估"}
               </button>
             </div>
           }
@@ -1092,7 +1463,34 @@ function RehabMain({ userName }: { userName: string }) {
             </div>
             <div className="live-pill">
               <span>训练状态</span>
-              <strong>{captureDoneRef.current ? "已完成" : "进行中"}</strong>
+              <strong>{captureDone ? "已完成" : "进行中"}</strong>
+            </div>
+          </div>
+
+          <div className="report-kv-grid" style={{ marginBottom: 12 }}>
+            <div className="report-kv">
+              <span>当前轮次</span>
+              <strong>{currentRound}/{maxRounds}</strong>
+            </div>
+            <div className="report-kv">
+              <span>当前目标</span>
+              <strong>
+                {trainPlan?.current_target != null
+                  ? `${(trainPlan.current_target * 100).toFixed(0)}%`
+                  : "--"}
+              </strong>
+            </div>
+            <div className="report-kv">
+              <span>当前阈值</span>
+              <strong>
+                {trainPlan?.current_threshold != null
+                  ? Number(trainPlan.current_threshold).toFixed(1)
+                  : "--"}
+              </strong>
+            </div>
+            <div className="report-kv">
+              <span>当前视频ID</span>
+              <strong>{currentVideoId}</strong>
             </div>
           </div>
 
@@ -1115,53 +1513,13 @@ function RehabMain({ userName }: { userName: string }) {
             <canvas ref={overlayRef} className="video-overlay" />
             <div className="frame-corner-badge">实时训练画面</div>
           </div>
-
-          <div className="progress-row">
-            <div className="progress-meta">
-              <span>训练完成度</span>
-              <strong>
-                {captureDoneRef.current
-                  ? "100%"
-                  : `${Math.min(
-                      99,
-                      Math.round(
-                        (framesBuffered / Math.max(1, currentTrainDurationMs / SAMPLE_INTERVAL_MS)) *
-                          100
-                      )
-                    )}%`}
-              </strong>
-            </div>
-            <div className="progress-track">
-              <div
-                className="progress-fill"
-                style={{
-                  width: `${
-                    captureDoneRef.current
-                      ? 100
-                      : Math.min(
-                          99,
-                          (framesBuffered /
-                            Math.max(1, currentTrainDurationMs / SAMPLE_INTERVAL_MS)) *
-                            100
-                        )
-                  }%`,
-                }}
-              />
-            </div>
-          </div>
-
-          <div className="helper-text">
-            {trainFinished
-              ? "标准视频已播放结束，请点击“开始评估”。"
-              : `当前训练视频时长：${(currentTrainDurationMs / 1000).toFixed(1)} 秒`}
-          </div>
         </SectionCard>
       </div>
 
       <div className="result-grid">
         <SectionCard
           title="训练结果报告"
-          desc="系统将基于标准动作和用户动作关键帧进行自动分析。"
+          desc="切换不同标准视频后，训练轮次会重新从第1轮开始。"
           extra={<StatusBadge text={scoreInfo.level} tone="success" />}
         >
           <div className="score-panel">
@@ -1202,6 +1560,38 @@ function RehabMain({ userName }: { userName: string }) {
                   <strong>{userKeyframesRef.current.length}</strong>
                 </div>
               </div>
+
+              {trainPlan ? (
+                <div className="report-kv-grid" style={{ marginTop: 12 }}>
+                  <div className="report-kv">
+                    <span>下一轮目标</span>
+                    <strong>
+                      {trainPlan?.current_target != null
+                        ? `${(Number(trainPlan.current_target) * 100).toFixed(0)}%`
+                        : "--"}
+                    </strong>
+                  </div>
+                  <div className="report-kv">
+                    <span>下一轮阈值</span>
+                    <strong>
+                      {trainPlan?.current_threshold != null
+                        ? Number(trainPlan.current_threshold).toFixed(1)
+                        : "--"}
+                    </strong>
+                  </div>
+                  <div className="report-kv">
+                    <span>下一轮轮次</span>
+                    <strong>
+                      {Math.min(trainPlan.current_round || 1, trainPlan.max_rounds || 4)}/
+                      {trainPlan.max_rounds || 4}
+                    </strong>
+                  </div>
+                  <div className="report-kv">
+                    <span>训练进度</span>
+                    <strong>{trainPlan.is_finished ? "已完成4轮" : "继续下一轮"}</strong>
+                  </div>
+                </div>
+              ) : null}
             </div>
           </div>
 
@@ -1212,6 +1602,8 @@ function RehabMain({ userName }: { userName: string }) {
                 <div className="error-text">{evalError}</div>
               ) : feedbackText ? (
                 feedbackText
+              ) : isConfirming ? (
+                "文字反馈生成中..."
               ) : (
                 "完成训练后，系统将在这里生成动作反馈与改进建议。"
               )}
@@ -1221,7 +1613,7 @@ function RehabMain({ userName }: { userName: string }) {
 
         <SectionCard
           title="数字人讲解反馈"
-          desc="结合评估结果生成视频化口播反馈，辅助用户理解动作问题。"
+          desc="数字人视频会在评分、文字反馈和训练计划更新后继续生成。"
         >
           <div className="coach-box">
             {coachVideoUrl ? (
@@ -1233,22 +1625,37 @@ function RehabMain({ userName }: { userName: string }) {
                 playsInline
                 className="coach-video"
               />
+            ) : isGeneratingCoach ? (
+              <div className="empty-video-state">数字人视频生成中...</div>
             ) : (
               <div className="empty-video-state">暂无数字人反馈视频</div>
             )}
           </div>
 
           <div className="privacy-note">
-            系统仅围绕本轮训练所需的关键帧与结构化评估数据进行处理，用于生成训练反馈。
+            系统会按当前选择的标准视频分别维护训练计划；切换视频后自动从第1轮重新开始。
           </div>
         </SectionCard>
       </div>
 
       <SectionCard
         title="系统调试信息"
-        desc="用于开发阶段查看后端返回的结构化结果。正式展示时可隐藏该模块。"
+        desc="用于开发阶段查看后端返回的结构化结果。"
       >
-        <pre className="debug-box">{JSON.stringify(result ?? {}, null, 2)}</pre>
+        <pre className="debug-box">
+          {JSON.stringify(
+            {
+              evaluate: result ?? {},
+              confirm: confirmResult ?? {},
+              trainPlan: trainPlan ?? {},
+              currentVideoId,
+              feedbackText,
+              coachVideoUrl,
+            },
+            null,
+            2
+          )}
+        </pre>
       </SectionCard>
     </div>
   );
@@ -1408,12 +1815,13 @@ function App() {
 
           <h1 className="entry-title">欢迎进入康复训练系统</h1>
           <p className="entry-desc">
-            系统将基于用户身份自动加载个性化标准动作视频，并结合摄像头姿态采集、动作评估和数字人讲解完成本轮训练。
+            系统将基于用户身份自动加载个性化标准动作视频，并结合摄像头姿态采集、动作评估、数字人讲解，以及按视频独立维护的训练轮次完成完整训练流程。
           </p>
 
           <div className="entry-feature-list">
             <div className="entry-feature">实时姿态识别与关键点采集</div>
             <div className="entry-feature">动作跟练与自动评估</div>
+            <div className="entry-feature">视频切换自动重置轮次</div>
             <div className="entry-feature">数字人视频化训练反馈</div>
           </div>
         </div>

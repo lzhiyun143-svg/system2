@@ -1,0 +1,23 @@
+{
+  "current_round": 1,
+  "max_rounds": 4,
+  "current_target": 0.75,
+  "current_threshold": 15.0,
+  "target_min": 0.6,
+  "target_max": 0.95,
+  "threshold_min": 5.0,
+  "threshold_max": 30.0,
+  "goal_step": 0.08,
+  "threshold_step": 3.0,
+  "alpha": 0.4,
+  "beta": 0.25,
+  "gamma": 0.25,
+  "delta": 0.1,
+  "base_value": 0.5,
+  "joint_weights": {
+    "shoulder": 0.7,
+    "elbow": 0.3
+  },
+  "history": [],
+  "is_finished": false
+}
