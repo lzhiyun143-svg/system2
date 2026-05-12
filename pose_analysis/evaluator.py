@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import math
 import os
 
@@ -36,6 +36,9 @@ class PoseEvaluator:
         # 规则达标判定
         self.default_pass_accuracy = float(os.getenv("DEFAULT_PASS_ACCURACY", "0.75"))
         self.default_pass_error = float(os.getenv("DEFAULT_PASS_ERROR", "15.0"))
+
+        # accuracy 衰减系数：原版相当于 0.35，这里放宽
+        self.accuracy_decay = float(os.getenv("ACCURACY_DECAY", "1.5"))
 
         # 关键点索引（MediaPipe Pose）
         self.LEFT_SHOULDER = 11
@@ -112,27 +115,49 @@ class PoseEvaluator:
             total += math.sqrt(dx * dx + dy * dy)
         return total / n
 
-    # --------- DTW ---------
-    def _dtw_distance(self, seq_a: List[Frame], seq_b: List[Frame]) -> float:
+    # --------- DTW：返回距离 + 最优路径 ---------
+    def _dtw_align(self, seq_a: List[Frame], seq_b: List[Frame]) -> Dict[str, Any]:
         if not seq_a or not seq_b:
-            return 1.0
+            return {"distance": 1.0, "path": []}
 
         n, m = len(seq_a), len(seq_b)
         dp = [[float("inf")] * (m + 1) for _ in range(n + 1)]
+        prev: List[List[Optional[Tuple[int, int]]]] = [[None] * (m + 1) for _ in range(n + 1)]
         dp[0][0] = 0.0
 
         for i in range(1, n + 1):
             for j in range(1, m + 1):
                 cost = self._frame_distance(seq_a[i - 1], seq_b[j - 1])
-                dp[i][j] = cost + min(
-                    dp[i - 1][j],
-                    dp[i][j - 1],
-                    dp[i - 1][j - 1],
-                )
 
-        return dp[n][m] / max(1, (n + m) / 2.0)
+                candidates = [
+                    (dp[i - 1][j], (i - 1, j)),
+                    (dp[i][j - 1], (i, j - 1)),
+                    (dp[i - 1][j - 1], (i - 1, j - 1)),
+                ]
+                best_prev_cost, best_prev = min(candidates, key=lambda x: x[0])
 
-    # --------- 关节误差 ---------
+                dp[i][j] = cost + best_prev_cost
+                prev[i][j] = best_prev
+
+        # 回溯最优路径
+        path: List[Tuple[int, int]] = []
+        i, j = n, m
+        while i > 0 and j > 0:
+            path.append((i - 1, j - 1))
+            p = prev[i][j]
+            if p is None:
+                break
+            i, j = p
+
+        path.reverse()
+
+        normalized_distance = dp[n][m] / max(1.0, (n + m) / 2.0)
+        return {
+            "distance": float(normalized_distance),
+            "path": path,
+        }
+
+    # --------- 关节误差工具 ---------
     def _mean_point(self, pts: List[Optional[List[float]]]) -> Optional[List[float]]:
         valid = [p for p in pts if p is not None]
         if not valid:
@@ -142,12 +167,13 @@ class PoseEvaluator:
             sum(p[1] for p in valid) / len(valid),
         ]
 
-    def _joint_errors(self, user_frames: List[Frame], std_frames: List[Frame]) -> Dict[str, float]:
-        if not user_frames or not std_frames:
-            return {"shoulder": 0.0, "elbow": 0.0}
-
-        n = min(len(user_frames), len(std_frames))
-        if n <= 0:
+    def _joint_errors_aligned(
+        self,
+        user_frames: List[Frame],
+        std_frames: List[Frame],
+        path: List[Tuple[int, int]],
+    ) -> Dict[str, float]:
+        if not user_frames or not std_frames or not path:
             return {"shoulder": 0.0, "elbow": 0.0}
 
         shoulder_err = 0.0
@@ -155,9 +181,12 @@ class PoseEvaluator:
         shoulder_cnt = 0
         elbow_cnt = 0
 
-        for i in range(n):
-            up = self._normalize_pose(user_frames[i].pose or [])
-            sp = self._normalize_pose(std_frames[i].pose or [])
+        for ui, si in path:
+            if ui < 0 or ui >= len(user_frames) or si < 0 or si >= len(std_frames):
+                continue
+
+            up = self._normalize_pose(user_frames[ui].pose or [])
+            sp = self._normalize_pose(std_frames[si].pose or [])
 
             # shoulder
             u_sh = self._mean_point([
@@ -194,6 +223,7 @@ class PoseEvaluator:
             "elbow": elbow_err / elbow_cnt if elbow_cnt > 0 else 0.0,
         }
 
+    # --------- 规则评论 ---------
     def _build_rule_comments(
         self,
         accuracy: float,
@@ -255,14 +285,16 @@ class PoseEvaluator:
         if not standard_frames:
             raise ValueError("standard_frames is empty")
 
-        dtw_distance = self._dtw_distance(user_frames, standard_frames)
+        align_out = self._dtw_align(user_frames, standard_frames)
+        dtw_distance = float(align_out["distance"])
+        path: List[Tuple[int, int]] = align_out["path"]
 
-        # 把距离映射成 0~1 准确度
-        # 距离越小越接近 1
-        accuracy = float(math.exp(-dtw_distance / 0.35))
+        # 放宽后的 accuracy：更适合用户动作稍慢的康复训练场景
+        decay = max(1e-6, float(self.accuracy_decay))
+        accuracy = float(math.exp(-dtw_distance / decay))
         accuracy = float(_clamp(accuracy, 0.0, 1.0))
 
-        joint_errors = self._joint_errors(user_frames, standard_frames)
+        joint_errors = self._joint_errors_aligned(user_frames, standard_frames, path)
         overall_error = self._overall_error(joint_errors)
         normalized_error = self._normalized_error(overall_error)
         pass_by_rule = self._pass_by_rule(accuracy, overall_error)
@@ -277,4 +309,10 @@ class PoseEvaluator:
             "normalized_error": float(normalized_error),
             "pass_by_rule": bool(pass_by_rule),
             "rule_based_comments": comments,
+
+            # 新增调试字段，方便你看是否用了对齐路径
+            "alignment_used": True,
+            "alignment_path_length": len(path),
+            "accuracy_decay": float(decay),
+            "joint_error_mode": "dtw_aligned",
         }

@@ -1,0 +1,105 @@
+{
+  "current_round": 4,
+  "max_rounds": 4,
+  "current_target": 0.632857901617529,
+  "current_threshold": 19.392828689342664,
+  "target_min": 0.6,
+  "target_max": 0.95,
+  "threshold_min": 5.0,
+  "threshold_max": 30.0,
+  "goal_step": 0.08,
+  "threshold_step": 3.0,
+  "alpha": 0.4,
+  "beta": 0.25,
+  "gamma": 0.25,
+  "delta": 0.1,
+  "base_value": 0.5,
+  "joint_weights": {
+    "shoulder": 0.7,
+    "elbow": 0.3
+  },
+  "history": [
+    {
+      "round": 1,
+      "timestamp": "2026-04-08T00:56:07",
+      "action": "raise_arm",
+      "video_id": "0",
+      "score": 30.0,
+      "score_level": "待提升",
+      "accuracy": 2.187221388839323e-10,
+      "joint_errors": {
+        "shoulder": 0.7099623618871582,
+        "elbow": 6.369355733732603
+      },
+      "overall_error": 2.407780373440792,
+      "normalized_error": 0.060194509336019796,
+      "pass_flag": 0,
+      "key_issue_count": 3,
+      "key_issues": [
+        "肩部抬举高度明显不足，未达到标准动作要求。",
+        "双臂姿态不对称，左臂略低。",
+        "肘部屈伸角度控制不佳，动作不够流畅。"
+      ],
+      "state_value": -0.06504862724651614,
+      "current_target": 0.75,
+      "current_threshold": 15.0,
+      "next_target": 0.7047961098202787,
+      "next_threshold": 16.69514588173955
+    },
+    {
+      "round": 2,
+      "timestamp": "2026-04-08T01:01:00",
+      "action": "raise_arm",
+      "video_id": "0",
+      "score": 30.0,
+      "score_level": "待提升",
+      "accuracy": 2.187221388839323e-10,
+      "joint_errors": {
+        "shoulder": 0.7099623618871582,
+        "elbow": 6.369355733732603
+      },
+      "overall_error": 2.407780373440792,
+      "normalized_error": 0.060194509336019796,
+      "pass_flag": 0,
+      "key_issue_count": 3,
+      "key_issues": [
+        "肩部抬举高度和左右对称性不足",
+        "肘部屈伸角度控制不够稳定",
+        "整体动作节奏和流畅度需提升"
+      ],
+      "state_value": -0.06504862724651614,
+      "current_target": 0.7047961098202787,
+      "current_threshold": 16.69514588173955,
+      "next_target": 0.6595922196405575,
+      "next_threshold": 18.390291763479098
+    },
+    {
+      "round": 3,
+      "timestamp": "2026-04-09T21:28:59",
+      "action": "raise_arm",
+      "video_id": "0",
+      "score": 61.6,
+      "score_level": "合格",
+      "accuracy": 0.5406625935368228,
+      "joint_errors": {
+        "shoulder": 0.013436063110847435,
+        "elbow": 0.20545596078673845
+      },
+      "overall_error": 0.07104203241361473,
+      "normalized_error": 0.0017760508103403683,
+      "pass_flag": 0,
+      "key_issue_count": 3,
+      "key_issues": [
+        "手臂未完全抬至水平位置",
+        "肘部在动作过程中弯曲角度控制不佳",
+        "动作节奏稍快，缺乏稳定性"
+      ],
+      "state_value": 0.165821024712144,
+      "current_target": 0.6595922196405575,
+      "current_threshold": 18.390291763479098,
+      "next_target": 0.632857901617529,
+      "next_threshold": 19.392828689342664
+    }
+  ],
+  "is_finished": false
+}

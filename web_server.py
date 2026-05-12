@@ -8,6 +8,7 @@ import re
 import json
 import base64
 import math
+import statistics
 from datetime import datetime
 from pathlib import Path
 
@@ -78,6 +79,152 @@ ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 def stage_log(tag: str, message: str) -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now}] [{tag}] {message}", flush=True)
+
+
+# =========================
+# Timing statistics
+# =========================
+TIMING_STATS_LOCK = threading.Lock()
+TIMING_STAGE_KEYS = [
+    "pose_evaluation",
+    "llm_feedback_generation",
+    "digital_human_synthesis",
+    "total_per_round",
+]
+TIMING_STAGE_LABELS = {
+    "pose_evaluation": "Pose evaluation",
+    "llm_feedback_generation": "LLM feedback generation",
+    "digital_human_synthesis": "Digital human synthesis",
+    "total_per_round": "Total per round",
+}
+TIMING_HISTORY: Dict[str, List[float]] = {k: [] for k in TIMING_STAGE_KEYS}
+TIMING_PENDING_ROUNDS: List[Dict[str, Any]] = []
+TIMING_MAX_HISTORY = int(os.getenv("TIMING_MAX_HISTORY", "200"))
+TIMING_MAX_PENDING = int(os.getenv("TIMING_MAX_PENDING", "50"))
+
+
+def _timing_trim_list(items: List[float], max_len: int = TIMING_MAX_HISTORY) -> List[float]:
+    if len(items) > max_len:
+        del items[:-max_len]
+    return items
+
+
+def _timing_stats(values: List[float]) -> Dict[str, float]:
+    vals = [float(v) for v in values if isinstance(v, (int, float)) and math.isfinite(float(v))]
+    if not vals:
+        return {"count": 0, "avg": 0.0, "std": 0.0}
+    avg = sum(vals) / len(vals)
+    std = statistics.stdev(vals) if len(vals) >= 2 else 0.0
+    return {"count": len(vals), "avg": avg, "std": std}
+
+
+def _timing_print_summary_unlocked() -> None:
+    lines = []
+    border = "-" * 66
+    lines.append(border)
+    lines.append(f"{'Module':<28} {'Avg. Time (s)':>14} {'Std. Dev.':>12} {'Count':>8}")
+    lines.append(border)
+    for key in TIMING_STAGE_KEYS:
+        s = _timing_stats(TIMING_HISTORY.get(key, []))
+        lines.append(
+            f"{TIMING_STAGE_LABELS[key]:<28} {s['avg']:>14.3f} {s['std']:>12.3f} {s['count']:>8d}"
+        )
+    lines.append(border)
+    stage_log("TimingStats", "\n" + "\n".join(lines))
+
+
+def _timing_add_stage(stage_key: str, elapsed_sec: float) -> None:
+    with TIMING_STATS_LOCK:
+        TIMING_HISTORY.setdefault(stage_key, []).append(float(elapsed_sec))
+        _timing_trim_list(TIMING_HISTORY[stage_key])
+
+
+def _timing_find_pending_for_confirm() -> Optional[Dict[str, Any]]:
+    for item in TIMING_PENDING_ROUNDS:
+        if item.get("pose_evaluation") is not None and item.get("llm_feedback_generation") is None:
+            return item
+    return None
+
+
+def _timing_find_pending_for_coach() -> Optional[Dict[str, Any]]:
+    for item in TIMING_PENDING_ROUNDS:
+        if item.get("pose_evaluation") is not None and item.get("llm_feedback_generation") is not None and item.get("digital_human_synthesis") is None:
+            return item
+    return None
+
+
+def _timing_register_stage(stage_key: str, elapsed_sec: float) -> None:
+    elapsed_sec = float(elapsed_sec)
+    if not math.isfinite(elapsed_sec):
+        return
+
+    with TIMING_STATS_LOCK:
+        TIMING_HISTORY.setdefault(stage_key, []).append(elapsed_sec)
+        _timing_trim_list(TIMING_HISTORY[stage_key])
+
+        if stage_key == "pose_evaluation":
+            TIMING_PENDING_ROUNDS.append({
+                "id": uuid.uuid4().hex[:8],
+                "created_at": time.time(),
+                "pose_evaluation": elapsed_sec,
+                "llm_feedback_generation": None,
+                "digital_human_synthesis": None,
+            })
+            if len(TIMING_PENDING_ROUNDS) > TIMING_MAX_PENDING:
+                del TIMING_PENDING_ROUNDS[:-TIMING_MAX_PENDING]
+            stage_log("Timing", f"Pose evaluation: {elapsed_sec:.3f}s")
+            return
+
+        if stage_key == "llm_feedback_generation":
+            pending = _timing_find_pending_for_confirm()
+            if pending is None:
+                pending = {
+                    "id": uuid.uuid4().hex[:8],
+                    "created_at": time.time(),
+                    "pose_evaluation": None,
+                    "llm_feedback_generation": None,
+                    "digital_human_synthesis": None,
+                }
+                TIMING_PENDING_ROUNDS.append(pending)
+            pending["llm_feedback_generation"] = elapsed_sec
+            stage_log("Timing", f"LLM feedback generation: {elapsed_sec:.3f}s")
+            return
+
+        if stage_key == "digital_human_synthesis":
+            pending = _timing_find_pending_for_coach()
+            if pending is None:
+                pending = {
+                    "id": uuid.uuid4().hex[:8],
+                    "created_at": time.time(),
+                    "pose_evaluation": None,
+                    "llm_feedback_generation": None,
+                    "digital_human_synthesis": None,
+                }
+                TIMING_PENDING_ROUNDS.append(pending)
+            pending["digital_human_synthesis"] = elapsed_sec
+            stage_log("Timing", f"Digital human synthesis: {elapsed_sec:.3f}s")
+
+            p = pending.get("pose_evaluation")
+            c = pending.get("llm_feedback_generation")
+            g = pending.get("digital_human_synthesis")
+            if all(isinstance(x, (int, float)) and math.isfinite(float(x)) for x in [p, c, g]):
+                total = float(p) + float(c) + float(g)
+                TIMING_HISTORY.setdefault("total_per_round", []).append(total)
+                _timing_trim_list(TIMING_HISTORY["total_per_round"])
+                stage_log(
+                    "Timing",
+                    f"Round {pending.get('id')} total: {total:.3f}s (pose={float(p):.3f}s, llm={float(c):.3f}s, digital_human={float(g):.3f}s)",
+                )
+                try:
+                    TIMING_PENDING_ROUNDS.remove(pending)
+                except ValueError:
+                    pass
+                _timing_print_summary_unlocked()
+            return
+
+
+def _timing_seconds(start_t: float) -> float:
+    return max(0.0, time.perf_counter() - float(start_t))
 
 
 # =========================
@@ -161,10 +308,10 @@ def _normalize_dtw_to_score(dtw_score: Any) -> float:
     try:
         v = float(dtw_score)
     except Exception:
-        return 60.0
+        return 70.0
 
     if not math.isfinite(v):
-        return 60.0
+        return 70.0
 
     if v < 0:
         v = 0.0
@@ -172,13 +319,13 @@ def _normalize_dtw_to_score(dtw_score: Any) -> float:
     if 0.0 <= v <= 1.0:
         return max(0.0, min(100.0, v * 100.0))
 
-    score = 100.0 * math.exp(-v / 0.35)
+    score = 100.0 * math.exp(-v / 0.60)
     return max(0.0, min(100.0, score))
 
 
 def _normalize_joint_errors_to_score(joint_errors: Any) -> float:
     if not isinstance(joint_errors, dict) or not joint_errors:
-        return 70.0
+        return 75.0
 
     vals: List[float] = []
     for _, val in joint_errors.items():
@@ -190,35 +337,35 @@ def _normalize_joint_errors_to_score(joint_errors: Any) -> float:
             pass
 
     if not vals:
-        return 70.0
+        return 75.0
 
     mean_err = sum(vals) / len(vals)
-    score = 100.0 * math.exp(-mean_err / 0.20)
+    score = 100.0 * math.exp(-mean_err / 0.30)
     return max(0.0, min(100.0, score))
 
 
 def compute_rehab_score(metric_out: Dict[str, Any]) -> Dict[str, Any]:
     acc_score = _normalize_percent(metric_out.get("accuracy"))
     if acc_score is None:
-        acc_score = 60.0
+        acc_score = 65.0
 
     dtw_score_norm = _normalize_dtw_to_score(metric_out.get("dtw_score"))
     joint_score = _normalize_joint_errors_to_score(metric_out.get("joint_errors"))
 
     raw_score = (
-        0.50 * acc_score +
-        0.20 * dtw_score_norm +
-        0.30 * joint_score
+        0.60 * acc_score +
+        0.15 * dtw_score_norm +
+        0.25 * joint_score
     )
 
     rule_comments = metric_out.get("rule_based_comments", []) or []
-    penalty = min(10.0, 1.5 * len(rule_comments))
+    penalty = min(8.0, 1.0 * len(rule_comments))
 
     final_score = raw_score - penalty
 
     user_frames = metric_out.get("_meta", {}).get("user_frames", 0) if isinstance(metric_out.get("_meta"), dict) else 0
     if user_frames >= 3:
-        final_score = max(20.0, final_score)
+        final_score = max(30.0, final_score)
 
     final_score = max(0.0, min(100.0, final_score))
 
@@ -287,7 +434,60 @@ def _trim_rule_comments(rule_comments: List[str]) -> List[str]:
             out.append(s)
     return out
 
+def llm_shorten_for_digital_human(full_text: str) -> str:
+    text = (full_text or "").strip()
+    if not text:
+        return "本轮训练已完成，请继续保持动作稳定。"
 
+    # 已经很短就不再压缩
+    if len(text) <= 90:
+        return text
+
+    try:
+        client = get_llm_client()
+        prompt = f"""
+你是康复训练数字人口播文案助手。
+
+请把下面这段康复反馈，压缩成适合数字人口播的简短版本，要求：
+1. 使用中文
+2. 保留核心意思，不要漏掉最重要的问题和建议
+3. 口语化、自然，像康复教练在说话
+4. 长度控制在 40~80 个汉字左右，尽量不要超过 2~3 句话
+5. 不要分点，不要编号，不要输出标题，只输出最终口播文本
+
+原始反馈：
+{text}
+""".strip()
+
+        resp = client.chat.completions.create(
+            model=DASHSCOPE_MODEL,
+            messages=[
+                {"role": "system", "content": "Return plain Chinese text only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=120,
+        )
+
+        short_text = (resp.choices[0].message.content or "").strip()
+        short_text = re.sub(r"\s+", " ", short_text)
+
+        if not short_text:
+            return text[:80]
+
+        # 再保险截断一下，避免太长
+        if len(short_text) > 100:
+            short_text = short_text[:100].rstrip("，。；、 ") + "。"
+
+        return short_text
+
+    except Exception:
+        # LLM 摘要失败时，退化为规则截断
+        simple = re.sub(r"\s+", " ", text)
+        if len(simple) > 80:
+            simple = simple[:80].rstrip("，。；、 ") + "。"
+        return simple
+    
 def llm_action_feedback(action: str, metric_out: Dict[str, Any]) -> str:
     client = get_llm_client()
 
@@ -491,6 +691,175 @@ def tts_text_to_wav(text: str, out_wav: Path) -> None:
     p2 = subprocess.run(cmd_ff, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if p2.returncode != 0 or (not out_wav.exists()):
         raise RuntimeError(f"ffmpeg convert failed: {p2.stdout[-2000:]}")
+
+
+def _build_generated_public_url(path: Path) -> str:
+    path = path.resolve()
+    try:
+        rel = path.relative_to(GENERATED_DIR).as_posix()
+        return f"/generated/{rel}"
+    except Exception:
+        raise RuntimeError(f"generated file is outside GENERATED_DIR: {path}")
+
+
+def _musetalk_abs_url(base: str, maybe_url: str) -> str:
+    base = (base or "").rstrip("/")
+    maybe_url = (maybe_url or "").strip()
+    if not maybe_url:
+        return ""
+    if maybe_url.startswith("http://") or maybe_url.startswith("https://"):
+        return maybe_url
+    if maybe_url.startswith("/"):
+        return f"{base}{maybe_url}"
+    return f"{base}/{maybe_url}"
+
+
+def _write_video_bytes(dst: Path, content: bytes) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with open(dst, "wb") as f:
+        f.write(content)
+
+
+def _download_to_generated(maybe_url: str, dst: Path) -> bool:
+    url = _musetalk_abs_url(MUSETALK_API_BASE, maybe_url)
+    if not url:
+        return False
+    try:
+        resp = requests.get(url, timeout=300)
+        if resp.status_code == 200 and resp.content:
+            _write_video_bytes(dst, resp.content)
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _collect_candidate_paths(payload: Dict[str, Any]) -> List[str]:
+    candidates: List[str] = []
+    for key in [
+        "url", "video_url", "download_url", "path", "output_path", "result_path",
+        "file_path", "saved_path", "filename", "output", "result",
+    ]:
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            candidates.append(val.strip())
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for key in [
+            "url", "video_url", "download_url", "path", "output_path", "result_path",
+            "file_path", "saved_path", "filename", "output", "result",
+        ]:
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                candidates.append(val.strip())
+    return candidates
+
+
+def _try_resolve_musetalk_response(resp: requests.Response, out_path: Path) -> Optional[str]:
+    ctype = (resp.headers.get("content-type") or "").lower()
+
+    if resp.status_code == 200 and ("video/" in ctype or out_path.suffix.lower() in [".mp4", ".webm"] and resp.content[:16]):
+        _write_video_bytes(out_path, resp.content)
+        return _build_generated_public_url(out_path)
+
+    payload: Optional[Dict[str, Any]] = None
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = None
+
+    if isinstance(payload, dict):
+        for candidate in _collect_candidate_paths(payload):
+            p = Path(candidate)
+            if p.exists() and p.is_file():
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(p, out_path)
+                return _build_generated_public_url(out_path)
+            if _download_to_generated(candidate, out_path):
+                return _build_generated_public_url(out_path)
+
+    return None
+
+def generate_musetalk_feedback_video(
+    user_name: str,
+    text: str,
+    version: str = "v1.5",
+    mode: str = "normal",
+) -> str:
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("empty text for coach video")
+
+    template_video = get_user_video_path(user_name)
+    if not template_video.exists():
+        raise FileNotFoundError(f"user template video not found: {template_video}")
+
+    user_safe = normalize_user_name(user_name)
+    out_dir = GENERATED_DIR / "coach_videos" / user_safe
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
+    wav_path = out_dir / f"{run_id}.wav"
+    out_video_path = out_dir / f"{run_id}.mp4"
+
+    # 1) 生成当前反馈对应的语音
+    tts_text_to_wav(text, wav_path)
+    if not wav_path.exists():
+        raise RuntimeError(f"TTS wav not created: {wav_path}")
+
+    infer_url = f"{MUSETALK_API_BASE.rstrip('/')}/infer"
+
+    # 2) 把“当前用户模板视频 + 当前反馈音频”直接传给 MuseTalk
+    with open(template_video, "rb") as f_video, open(wav_path, "rb") as f_audio:
+        files = {
+            "video": (template_video.name, f_video, "video/mp4"),
+            "audio": (wav_path.name, f_audio, "audio/wav"),
+        }
+        data = {
+            "version": version,
+            "mode": mode,
+            "user_name": user_name,
+        }
+
+        resp = requests.post(infer_url, files=files, data=data, timeout=1800)
+
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"MuseTalk infer failed: {resp.status_code} {resp.text[:3000]}"
+        )
+
+    content_type = (resp.headers.get("content-type") or "").lower()
+
+    # 3) 如果直接返回视频二进制
+    if "video" in content_type or resp.content[:12].startswith(b"\x00\x00\x00"):
+        out_video_path.write_bytes(resp.content)
+        return f"/generated/coach_videos/{user_safe}/{out_video_path.name}"
+
+    # 4) 如果返回 JSON
+    try:
+        payload = resp.json()
+    except Exception:
+        raise RuntimeError(f"MuseTalk returned unknown response: {resp.text[:1000]}")
+
+    # 4.1 直接返回可下载 URL
+    url = payload.get("url") or payload.get("video_url")
+    if url:
+        if url.startswith("http://") or url.startswith("https://"):
+            return url
+
+        # 相对路径时，补成对当前 MuseTalk 服务可访问的地址
+        return f"{MUSETALK_API_BASE.rstrip('/')}{url if url.startswith('/') else '/' + url}"
+
+    # 4.2 返回本地文件路径
+    local_path = payload.get("local_path") or payload.get("output") or payload.get("video_path")
+    if local_path:
+        src = Path(local_path)
+        if not src.exists():
+            raise RuntimeError(f"MuseTalk output path not found: {src}")
+        shutil.copyfile(src, out_video_path)
+        return f"/generated/coach_videos/{user_safe}/{out_video_path.name}"
+
+    raise RuntimeError(f"MuseTalk response missing url/local_path: {payload}")
 
 
 # =========================
@@ -972,11 +1341,13 @@ def run_evaluate_core(req: EvalRequest) -> Dict[str, Any]:
     if len(user_frames) < 3:
         raise HTTPException(status_code=400, detail="Too few valid frames (<3).")
 
+    pose_eval_t0 = time.perf_counter()
     out = evaluator.evaluate(
         action=req.action,
         user_frames=user_frames,
         standard_frames=std_frames,
     )
+    pose_eval_sec = _timing_seconds(pose_eval_t0)
 
     out["_meta"] = {
         "user_frames": len(user_frames),
@@ -984,17 +1355,26 @@ def run_evaluate_core(req: EvalRequest) -> Dict[str, Any]:
         "use_standard": bool(std_frames),
         "use_llm_feedback": bool(req.use_llm),
     }
-
+    print("accuracy =", out.get("accuracy"))
+    print("dtw_score =", out.get("dtw_score"))
+    print("joint_errors =", out.get("joint_errors"))
+    print("rule_based_comments =", out.get("rule_based_comments"))
+    
     score_info = compute_rehab_score(out)
+    print("score_breakdown =", score_info["score_breakdown"])
+    print("final_score =", score_info["score"])
     out["score"] = score_info["score"]
     out["score_breakdown"] = score_info["score_breakdown"]
     out["score_level"] = score_info["score_level"]
+    out.setdefault("_timing", {})["pose_evaluation_sec"] = round(pose_eval_sec, 6)
 
     if req.use_llm:
         try:
+            llm_t0 = time.perf_counter()
             out["llm_feedback"] = llm_action_feedback(req.action, out)
             out["llm_used"] = True
             out["llm_model"] = DASHSCOPE_MODEL
+            out.setdefault("_timing", {})["evaluate_side_llm_feedback_sec"] = round(_timing_seconds(llm_t0), 6)
         except Exception as e:
             out["llm_used"] = False
             out["llm_error"] = f"{type(e).__name__}: {e}"
@@ -1228,7 +1608,19 @@ def api_standard_video_build(req: BuildStandardVideoRequest):
 @app.post("/api/evaluate")
 def api_evaluate(req: EvalRequest) -> Dict[str, Any]:
     try:
-        return run_evaluate_core(req)
+        result = run_evaluate_core(req)
+        pose_eval_sec = None
+        try:
+            pose_eval_sec = float(result.get("_timing", {}).get("pose_evaluation_sec"))
+        except Exception:
+            pose_eval_sec = None
+
+        if pose_eval_sec is None or (not math.isfinite(pose_eval_sec)):
+            pose_eval_sec = None
+
+        if pose_eval_sec is not None:
+            _timing_register_stage("pose_evaluation", pose_eval_sec)
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -1237,6 +1629,7 @@ def api_evaluate(req: EvalRequest) -> Dict[str, Any]:
 
 @app.post("/api/confirm")
 def api_confirm_post(req: ConfirmRequest) -> Dict[str, Any]:
+    t0 = time.perf_counter()
     try:
         if req.frames is not None and len(req.frames) < 3:
             raise HTTPException(status_code=400, detail="Too few valid frames (<3).")
@@ -1263,7 +1656,7 @@ def api_confirm_post(req: ConfirmRequest) -> Dict[str, Any]:
             except Exception:
                 pass
 
-            return {
+            resp = {
                 "action": req.action,
                 "confirm_mode": "vision_keyframes",
                 "llm_confirm": llm_out,
@@ -1273,42 +1666,54 @@ def api_confirm_post(req: ConfirmRequest) -> Dict[str, Any]:
                     "saved_user_count": save_info["saved_user_count"],
                 },
             }
+            _timing_register_stage("llm_feedback_generation", _timing_seconds(t0))
+            return resp
 
         llm_out = llm_confirm_judge(req.action, req.eval_result or {})
-        return {
+        resp = {
             "action": req.action,
             "confirm_mode": "json_eval",
             "llm_confirm": llm_out,
         }
+        _timing_register_stage("llm_feedback_generation", _timing_seconds(t0))
+        return resp
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM confirm POST failed: {type(e).__name__}: {e}")
 
-
 @app.post("/api/coach_video_v2")
 def api_coach_video_v2(req: CoachVideoRequest) -> Dict[str, Any]:
     if not req.text.strip():
         raise HTTPException(status_code=422, detail="text is empty")
 
+    t0 = time.perf_counter()
     try:
+        display_text = req.text.strip()
+        speech_text = llm_shorten_for_digital_human(display_text)
+
         url = generate_musetalk_feedback_video(
             user_name=req.user_name,
-            text=req.text,
+            text=speech_text,
             version=req.version or "v1.5",
             mode=req.mode or "normal",
         )
-        return {
+
+        resp = {
             "ok": True,
             "url": url,
-            "text": req.text,
+            "text": display_text,          # 页面仍显示完整反馈
+            "speech_text": speech_text,    # 数字人实际使用的短文本
             "user_name": req.user_name,
             "template_video": str(get_user_video_path(req.user_name)),
         }
+
+        _timing_register_stage("digital_human_synthesis", _timing_seconds(t0))
+        return resp
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"coach_video_v2 failed: {type(e).__name__}: {e}")
-
 
 @app.get("/api/training/plan/get")
 def api_training_plan_get(name: str, action: str, video_id: str) -> Dict[str, Any]:

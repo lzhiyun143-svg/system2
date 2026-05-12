@@ -62,7 +62,7 @@ const POSE_TASK_URL =
 const HAND_TASK_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = "http://localhost:8000";
 const EVAL_API = `${API_BASE}/api/evaluate`;
 const CONFIRM_API = `${API_BASE}/api/confirm`;
 const COACH_VIDEO_V2_API = `${API_BASE}/api/coach_video_v2`;
@@ -143,18 +143,33 @@ function getKeyframeTargets(totalMs: number) {
   return targets;
 }
 
+function getAdaptiveFrameStyle(aspect: number, maxHeight = 360) {
+  const safeAspect =
+    typeof aspect === "number" && Number.isFinite(aspect) && aspect > 0
+      ? aspect
+      : 16 / 9;
+
+  const computedMaxWidth = Math.round(maxHeight * safeAspect);
+
+  return {
+    aspectRatio: `${safeAspect}`,
+    width: `min(100%, ${computedMaxWidth}px)`,
+    maxWidth: "100%",
+    height: "auto",
+    margin: "0 auto",
+  } as React.CSSProperties;
+}
+
 function getScoreInfo(result: any) {
   const candidates = [
     result?.score,
     result?.final_score,
     result?.total_score,
     result?.overall_score,
-
     result?.evaluate?.score,
     result?.evaluate?.final_score,
     result?.evaluate?.total_score,
     result?.evaluate?.overall_score,
-
     result?.result?.score,
   ];
 
@@ -266,14 +281,16 @@ function SectionCard({
   desc,
   extra,
   children,
+  className = "",
 }: {
   title: string;
   desc?: string;
   extra?: React.ReactNode;
   children: React.ReactNode;
+  className?: string;
 }) {
   return (
-    <section className="panel-card">
+    <section className={`panel-card ${className}`.trim()}>
       <div className="panel-head">
         <div>
           <h3 className="panel-title">{title}</h3>
@@ -453,7 +470,9 @@ function RehabMain({ userName }: { userName: string }) {
   async function loadTrainPlan(videoId: string) {
     try {
       const resp = await fetchWithTimeout(
-        `${TRAIN_PLAN_GET_API}?name=${encodeURIComponent(userName)}&action=${encodeURIComponent(action)}&video_id=${encodeURIComponent(videoId)}`,
+        `${TRAIN_PLAN_GET_API}?name=${encodeURIComponent(userName)}&action=${encodeURIComponent(
+          action
+        )}&video_id=${encodeURIComponent(videoId)}`,
         { method: "GET" },
         PLAN_TIMEOUT_MS
       );
@@ -574,7 +593,7 @@ function RehabMain({ userName }: { userName: string }) {
 
   function captureVideoFrameToDataURL(
     video: HTMLVideoElement,
-    maxW = 480,
+    maxW = 400,
     quality = 0.7
   ): string | null {
     const w = video.videoWidth;
@@ -653,7 +672,7 @@ function RehabMain({ userName }: { userName: string }) {
       });
 
       if (nextKeyIdx < keyTargets.length && t >= keyTargets[nextKeyIdx]) {
-        const img = captureVideoFrameToDataURL(video, 480, 0.7);
+        const img = captureVideoFrameToDataURL(video, 400, 0.7);
         if (img) stdKeyframesRef.current.push(img);
         nextKeyIdx += 1;
       }
@@ -672,7 +691,7 @@ function RehabMain({ userName }: { userName: string }) {
     }
 
     while (stdKeyframesRef.current.length < keyTargets.length) {
-      const img = captureVideoFrameToDataURL(video, 480, 0.7);
+      const img = captureVideoFrameToDataURL(video, 400, 0.7);
       if (!img) break;
       stdKeyframesRef.current.push(img);
     }
@@ -901,7 +920,7 @@ function RehabMain({ userName }: { userName: string }) {
       if (userKeyframesRef.current.length < keyTargets.length) {
         const nextTarget = keyTargets[userKeyframesRef.current.length];
         if (elapsed >= nextTarget) {
-          const img = captureVideoFrameToDataURL(video, 480, 0.7);
+          const img = captureVideoFrameToDataURL(video, 400, 0.7);
           if (img) userKeyframesRef.current.push(img);
         }
       }
@@ -938,7 +957,9 @@ function RehabMain({ userName }: { userName: string }) {
 
     if (!captureDone) {
       setEvalError(
-        `当前训练尚未完成，请先跟随左侧视频训练完毕（约 ${(currentTrainDurationMs / 1000).toFixed(1)} 秒）`
+        `当前训练尚未完成，请先跟随左侧视频训练完毕（约 ${(currentTrainDurationMs / 1000).toFixed(
+          1
+        )} 秒）`
       );
       return;
     }
@@ -1193,7 +1214,7 @@ function RehabMain({ userName }: { userName: string }) {
         </div>
       </header>
 
-      <section className="hero-banner">
+      <section className="hero-banner ultra-compact-hero">
         <div className="hero-text">
           <div className="hero-kicker">个性化 · 智能化 · 可追踪</div>
           <h1 className="hero-title">面向上肢康复训练的智能辅助系统</h1>
@@ -1208,7 +1229,7 @@ function RehabMain({ userName }: { userName: string }) {
           </div>
         </div>
 
-        <div className="hero-stats">
+        <div className="hero-stats mini-hero-stats">
           <StatCard label="当前动作" value={action} sub="固定训练动作" />
           <StatCard
             label="训练轮次"
@@ -1252,318 +1273,332 @@ function RehabMain({ userName }: { userName: string }) {
         </div>
       )}
 
-      <div className="training-grid">
-        <SectionCard
-          title="标准示范"
-          desc="系统将自动加载当前用户对应的个性化标准动作视频。"
-          extra={
-            <StatusBadge
-              text={standardReady ? "标准骨架已就绪" : "标准骨架构建中"}
-              tone={standardReady ? "success" : "warn"}
-            />
-          }
-        >
-          <div className="video-card-wrap">
-            <div className="video-header-inline">
-              <div className="inline-meta">
-                <span>视频数量：{stdVideoList.length}</span>
-                <span>当前时长：{(currentTrainDurationMs / 1000).toFixed(1)} 秒</span>
-              </div>
-            </div>
-
-            <div
-              className="video-frame standard-frame adaptive-frame"
-              style={{ aspectRatio: `${stdVideoAspect}` }}
-            >
-              <video
-                ref={stdPlayerRef}
-                src={activeStandardVideoSrc || undefined}
-                controls
-                muted
-                playsInline
-                onLoadedMetadata={(e) => {
-                  const el = e.currentTarget;
-                  const durSec =
-                    el.duration && Number.isFinite(el.duration) ? el.duration : 3;
-                  const durMs = Math.max(1000, Math.round(durSec * 1000));
-                  setCurrentTrainDurationMs(durMs);
-
-                  if (el.videoWidth > 0 && el.videoHeight > 0) {
-                    setStdVideoAspect(el.videoWidth / el.videoHeight);
-                  }
-                }}
-                onEnded={() => {
-                  setTrainFinished(true);
-                  if (isPlanFinished) {
-                    setTrainHint("该视频已完成 4 轮训练。");
-                  } else {
-                    setTrainHint("本轮示范播放完成，请点击“开始评估”获取结果。");
-                  }
-                  captureDoneRef.current = true;
-                  setCaptureDone(true);
-                }}
-                className="video-element fit-contain"
+      <div className="dashboard-grid dashboard-grid-2col-compact">
+        <div className="dashboard-left dashboard-left-stack">
+          <SectionCard
+            className="standard-panel"
+            title="标准示范"
+            desc="自动加载当前用户的个性化标准动作视频，视频区域按比例紧凑展示。"
+            extra={
+              <StatusBadge
+                text={standardReady ? "标准骨架已就绪" : "标准骨架构建中"}
+                tone={standardReady ? "success" : "warn"}
               />
-            </div>
+            }
+          >
+            <div className="media-info-layout">
+              <div className="media-column">
+                <div className="video-header-inline">
+                  <div className="inline-meta">
+                    <span>视频数量：{stdVideoList.length}</span>
+                    <span>当前时长：{(currentTrainDurationMs / 1000).toFixed(1)} 秒</span>
+                  </div>
+                </div>
 
-            <video
-              ref={standardVideoRef}
-              src={activeStandardVideoSrc || undefined}
-              muted
-              playsInline
-              crossOrigin="anonymous"
-              preload="auto"
-              style={{ display: "none" }}
-            />
+                <div
+                  className="video-frame standard-frame standard-split-frame"
+                  style={getAdaptiveFrameStyle(stdVideoAspect, 290)}
+                >
+                  <video
+                    ref={stdPlayerRef}
+                    src={activeStandardVideoSrc || undefined}
+                    controls
+                    muted
+                    playsInline
+                    onLoadedMetadata={(e) => {
+                      const el = e.currentTarget;
+                      const durSec =
+                        el.duration && Number.isFinite(el.duration) ? el.duration : 3;
+                      const durMs = Math.max(1000, Math.round(durSec * 1000));
+                      setCurrentTrainDurationMs(durMs);
 
-            {!activeStandardVideoSrc && (
-              <div className="empty-state-mini">当前暂无可播放的个性化标准视频</div>
-            )}
+                      if (el.videoWidth > 0 && el.videoHeight > 0) {
+                        setStdVideoAspect(el.videoWidth / el.videoHeight);
+                      }
+                    }}
+                    onEnded={() => {
+                      setTrainFinished(true);
+                      if (isPlanFinished) {
+                        setTrainHint("该视频已完成 4 轮训练。");
+                      } else {
+                        setTrainHint("本轮示范播放完成，请点击“开始评估”获取结果。");
+                      }
+                      captureDoneRef.current = true;
+                      setCaptureDone(true);
+                    }}
+                    className="video-element fit-contain"
+                  />
+                </div>
 
-            {stdVideoList.length > 0 && (
-              <div className="video-switcher">
-                <div className="switcher-title">标准视频切换</div>
-                <div className="switcher-grid">
-                  {stdVideoList.map((item, idx) => {
-                    const url = item.video_url || "";
-                    const active = url === activeStandardVideoSrc;
-                    return (
-                      <button
-                        key={`${item.id || idx}_${item.file_name || idx}`}
-                        onClick={async () => {
-                          setSelectedStdVideoUrl(url);
-                          setStatusText(`已切换到第 ${idx + 1} 个标准视频，正在重置训练轮次...`);
+                <video
+                  ref={standardVideoRef}
+                  src={activeStandardVideoSrc || undefined}
+                  muted
+                  playsInline
+                  crossOrigin="anonymous"
+                  preload="auto"
+                  style={{ display: "none" }}
+                />
 
-                          setTrainFinished(false);
-                          setTrainHint("");
-                          captureDoneRef.current = false;
-                          setCaptureDone(false);
+                {!activeStandardVideoSrc && (
+                  <div className="empty-state-mini">当前暂无可播放的个性化标准视频</div>
+                )}
 
-                          setStandardReady(false);
-                          standardReadyRef.current = false;
-                          standardSeqRef.current = [];
-                          stdKeyframesRef.current = [];
+                <div className="train-note">
+                  {trainFinished
+                    ? trainHint || "本轮训练结束，请点击评估。"
+                    : "点击“开启摄像头”后，系统将同步进行跟练采集。"}
+                </div>
 
-                          framesRef.current = [];
-                          userKeyframesRef.current = [];
-                          setFramesBuffered(0);
+                <div className="mini-status-text">
+                  {buildingStandard ? "标准视频处理中..." : statusText}
+                </div>
+              </div>
 
-                          setResult(null);
-                          setConfirmResult(null);
-                          setFeedbackText("");
-                          setCoachVideoUrl("");
-                          setEvalError("");
+              <div className="info-column standard-info-column">
+                <div className="side-block-title">标准视频切换</div>
+                {stdVideoList.length > 0 ? (
+                  <div className="side-switcher-list">
+                    {stdVideoList.map((item, idx) => {
+                      const url = item.video_url || "";
+                      const active = url === activeStandardVideoSrc;
+                      return (
+                        <button
+                          key={`${item.id || idx}_${item.file_name || idx}`}
+                          onClick={async () => {
+                            setSelectedStdVideoUrl(url);
+                            setStatusText(`已切换到第 ${idx + 1} 个标准视频，正在重置训练轮次...`);
 
-                          const nextVideoId = String(item.id || item.file_name || `video_${idx + 1}`);
+                            setTrainFinished(false);
+                            setTrainHint("");
+                            captureDoneRef.current = false;
+                            setCaptureDone(false);
 
-                          try {
-                            const resp = await fetchWithTimeout(
-                              TRAIN_PLAN_RESET_API,
-                              {
-                                method: "POST",
-                                headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({
-                                  user_name: userName,
-                                  action,
-                                  video_id: nextVideoId,
-                                }),
-                              },
-                              PLAN_TIMEOUT_MS
+                            setStandardReady(false);
+                            standardReadyRef.current = false;
+                            standardSeqRef.current = [];
+                            stdKeyframesRef.current = [];
+
+                            framesRef.current = [];
+                            userKeyframesRef.current = [];
+                            setFramesBuffered(0);
+
+                            setResult(null);
+                            setConfirmResult(null);
+                            setFeedbackText("");
+                            setCoachVideoUrl("");
+                            setEvalError("");
+
+                            const nextVideoId = String(
+                              item.id || item.file_name || `video_${idx + 1}`
                             );
 
-                            const text = await resp.text();
-                            if (!resp.ok) throw new Error(text || `HTTP ${resp.status}`);
+                            try {
+                              const resp = await fetchWithTimeout(
+                                TRAIN_PLAN_RESET_API,
+                                {
+                                  method: "POST",
+                                  headers: { "Content-Type": "application/json" },
+                                  body: JSON.stringify({
+                                    user_name: userName,
+                                    action,
+                                    video_id: nextVideoId,
+                                  }),
+                                },
+                                PLAN_TIMEOUT_MS
+                              );
 
-                            const parsed = JSON.parse(text);
-                            setTrainPlan(parsed?.train_plan || null);
-                            setStatusText(`已切换到第 ${idx + 1} 个标准视频，并从第1轮重新开始训练`);
-                          } catch (e: any) {
-                            console.error(e);
-                            setStatusText(`视频已切换，但训练轮次重置失败：${e?.message || e}`);
-                          }
-                        }}
-                        className={`switcher-btn ${active ? "active" : ""}`}
-                      >
-                        <div className="switcher-file">
-                          {item.file_name || `video_${idx + 1}.mp4`}
-                        </div>
-                        <div className="switcher-state">
-                          {active ? "当前使用中" : "点击切换"}
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
+                              const text = await resp.text();
+                              if (!resp.ok) throw new Error(text || `HTTP ${resp.status}`);
+
+                              const parsed = JSON.parse(text);
+                              setTrainPlan(parsed?.train_plan || null);
+                              setStatusText(
+                                `已切换到第 ${idx + 1} 个标准视频，并从第1轮重新开始训练`
+                              );
+                            } catch (e: any) {
+                              console.error(e);
+                              setStatusText(`视频已切换，但训练轮次重置失败：${e?.message || e}`);
+                            }
+                          }}
+                          className={`switcher-btn side-switcher-btn ${active ? "active" : ""}`}
+                        >
+                          <div className="switcher-file">
+                            {item.file_name || `video_${idx + 1}.mp4`}
+                          </div>
+                          <div className="switcher-state">
+                            {active ? "当前使用中" : "点击切换"}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="empty-state-mini">暂无标准视频按钮</div>
+                )}
               </div>
-            )}
+            </div>
+          </SectionCard>
 
-            <div className="train-note">
-              {trainFinished
-                ? trainHint || "本轮训练结束，请点击评估。"
-                : "点击“开启摄像头”后，系统将同步进行跟练采集。"}
-            </div>
-
-            <div className="mini-status-text">
-              {buildingStandard ? "标准视频处理中..." : statusText}
-            </div>
-          </div>
-        </SectionCard>
-
-        <SectionCard
-          title="实时训练"
-          desc="切换标准视频后会自动从第1轮重新开始训练。"
-          extra={
-            <div className="panel-action-row">
-              <button
-                onClick={startCamera}
-                disabled={mpStatus !== "ready" || cameraOn || isPlanFinished}
-                className="btn btn-primary"
-              >
-                开启摄像头
-              </button>
-              <button
-                onClick={stopCamera}
-                disabled={!cameraOn}
-                className="btn btn-secondary"
-              >
-                停止采集
-              </button>
-              <button
-                onClick={evaluateAuto}
-                disabled={!canEvaluate}
-                className="btn btn-accent"
-              >
-                {isEvaluating
-                  ? "评分中..."
-                  : isConfirming
-                  ? "文字生成中..."
-                  : isUpdatingPlan
-                  ? "更新计划中..."
-                  : isGeneratingCoach
-                  ? "数字人生成中..."
-                  : isPlanFinished
-                  ? "已完成4轮"
-                  : "开始评估"}
-              </button>
-            </div>
-          }
-        >
-          <div className="live-stats-grid">
-            <div className="live-pill">
-              <span>摄像头</span>
-              <strong>{cameraOn ? "已开启" : "未开启"}</strong>
-            </div>
-            <div className="live-pill">
-              <span>人体姿态</span>
-              <strong>{poseDetected ? "已检测" : "未检测"}</strong>
-            </div>
-            <div className="live-pill">
-              <span>手部关键点</span>
-              <strong>{handsDetected ? "已检测" : "未检测"}</strong>
-            </div>
-            <div className="live-pill">
-              <span>训练状态</span>
-              <strong>{captureDone ? "已完成" : "进行中"}</strong>
-            </div>
-          </div>
-
-          <div className="report-kv-grid" style={{ marginBottom: 12 }}>
-            <div className="report-kv">
-              <span>当前轮次</span>
-              <strong>{currentRound}/{maxRounds}</strong>
-            </div>
-            <div className="report-kv">
-              <span>当前目标</span>
-              <strong>
-                {trainPlan?.current_target != null
-                  ? `${(trainPlan.current_target * 100).toFixed(0)}%`
-                  : "--"}
-              </strong>
-            </div>
-            <div className="report-kv">
-              <span>当前阈值</span>
-              <strong>
-                {trainPlan?.current_threshold != null
-                  ? Number(trainPlan.current_threshold).toFixed(1)
-                  : "--"}
-              </strong>
-            </div>
-            <div className="report-kv">
-              <span>当前视频ID</span>
-              <strong>{currentVideoId}</strong>
-            </div>
-          </div>
-
-          <div
-            className="video-frame user-frame adaptive-frame"
-            style={{ aspectRatio: `${userVideoAspect}` }}
+          <SectionCard
+            className="realtime-panel"
+            title="实时训练"
+            desc="切换标准视频后会自动从第1轮重新开始训练。"
+            extra={
+              <div className="panel-action-row tighter-actions">
+                <button
+                  onClick={startCamera}
+                  disabled={mpStatus !== "ready" || cameraOn || isPlanFinished}
+                  className="btn btn-primary"
+                >
+                  开启摄像头
+                </button>
+                <button
+                  onClick={stopCamera}
+                  disabled={!cameraOn}
+                  className="btn btn-secondary"
+                >
+                  停止采集
+                </button>
+                <button
+                  onClick={evaluateAuto}
+                  disabled={!canEvaluate}
+                  className="btn btn-accent"
+                >
+                  {isEvaluating
+                    ? "评分中..."
+                    : isConfirming
+                    ? "文字生成中..."
+                    : isUpdatingPlan
+                    ? "更新计划中..."
+                    : isGeneratingCoach
+                    ? "数字人生成中..."
+                    : isPlanFinished
+                    ? "已完成4轮"
+                    : "开始评估"}
+                </button>
+              </div>
+            }
           >
-            <video
-              ref={userVideoRef}
-              playsInline
-              muted
-              onLoadedMetadata={(e) => {
-                const el = e.currentTarget;
-                if (el.videoWidth > 0 && el.videoHeight > 0) {
-                  setUserVideoAspect(el.videoWidth / el.videoHeight);
-                }
-              }}
-              className="video-element mirrored fit-contain"
-            />
-            <canvas ref={overlayRef} className="video-overlay" />
-            <div className="frame-corner-badge">实时训练画面</div>
-          </div>
-        </SectionCard>
-      </div>
+            <div className="media-info-layout">
+              <div className="media-column">
+                <div
+                  className="video-frame realtime-split-frame"
+                  style={getAdaptiveFrameStyle(userVideoAspect, 330)}
+                >
+                  <video
+                    ref={userVideoRef}
+                    playsInline
+                    muted
+                    onLoadedMetadata={(e) => {
+                      const el = e.currentTarget;
+                      if (el.videoWidth > 0 && el.videoHeight > 0) {
+                        setUserVideoAspect(el.videoWidth / el.videoHeight);
+                      }
+                    }}
+                    className="video-element mirrored fit-contain"
+                  />
+                  <canvas ref={overlayRef} className="video-overlay" />
+                  <div className="frame-corner-badge">实时训练画面</div>
+                </div>
+              </div>
 
-      <div className="result-grid">
-        <SectionCard
-          title="训练结果报告"
-          desc="切换不同标准视频后，训练轮次会重新从第1轮开始。"
-          extra={<StatusBadge text={scoreInfo.level} tone="success" />}
-        >
-          <div className="score-panel">
-            <div className="score-ring">
-              <div className="score-ring-inner">
-                <div className="score-num">{scoreInfo.score}</div>
-                <div className="score-unit">分</div>
+              <div className="info-column realtime-info-column">
+                <div className="metric-grid-2col-4row">
+                  <div className="report-kv mini-kv">
+                    <span>摄像头</span>
+                    <strong>{cameraOn ? "已开启" : "未开启"}</strong>
+                  </div>
+                  <div className="report-kv mini-kv">
+                    <span>人体姿态</span>
+                    <strong>{poseDetected ? "已检测" : "未检测"}</strong>
+                  </div>
+                  <div className="report-kv mini-kv">
+                    <span>手部关键点</span>
+                    <strong>{handsDetected ? "已检测" : "未检测"}</strong>
+                  </div>
+                  <div className="report-kv mini-kv">
+                    <span>训练状态</span>
+                    <strong>{captureDone ? "已完成" : "进行中"}</strong>
+                  </div>
+
+                  <div className="report-kv mini-kv">
+                    <span>当前轮次</span>
+                    <strong>
+                      {currentRound}/{maxRounds}
+                    </strong>
+                  </div>
+                  <div className="report-kv mini-kv">
+                    <span>当前目标</span>
+                    <strong>
+                      {trainPlan?.current_target != null
+                        ? `${(trainPlan.current_target * 100).toFixed(0)}%`
+                        : "--"}
+                    </strong>
+                  </div>
+                  <div className="report-kv mini-kv">
+                    <span>当前阈值</span>
+                    <strong>
+                      {trainPlan?.current_threshold != null
+                        ? Number(trainPlan.current_threshold).toFixed(1)
+                        : "--"}
+                    </strong>
+                  </div>
+                  <div className="report-kv mini-kv">
+                    <span>当前视频ID</span>
+                    <strong>{currentVideoId}</strong>
+                  </div>
+                </div>
               </div>
             </div>
+          </SectionCard>
+        </div>
 
-            <div className="score-details">
-              <div className="score-bar-head">
-                <span>综合评分</span>
-                <strong>{scoreInfo.percent}%</strong>
-              </div>
-              <div className="score-bar">
-                <div
-                  className="score-bar-fill"
-                  style={{ width: `${scoreInfo.percent}%` }}
-                />
-              </div>
-
-              <div className="report-kv-grid">
-                <div className="report-kv">
-                  <span>动作名称</span>
-                  <strong>{action}</strong>
-                </div>
-                <div className="report-kv">
-                  <span>采集帧数</span>
-                  <strong>{framesBuffered}</strong>
-                </div>
-                <div className="report-kv">
-                  <span>标准关键帧</span>
-                  <strong>{stdKeyframesRef.current.length}</strong>
-                </div>
-                <div className="report-kv">
-                  <span>用户关键帧</span>
-                  <strong>{userKeyframesRef.current.length}</strong>
+        <div className="dashboard-right dashboard-right-stack">
+          <SectionCard
+            className="report-panel"
+            title="训练结果报告"
+            desc="评估后展示评分、统计与下一轮目标。"
+            extra={<StatusBadge text={scoreInfo.level} tone="success" />}
+          >
+            <div className="score-panel tighter-score-panel">
+              <div className="score-ring mini-score-ring">
+                <div className="score-ring-inner mini-score-ring-inner">
+                  <div className="score-num mini-score-num">{scoreInfo.score}</div>
+                  <div className="score-unit">分</div>
                 </div>
               </div>
 
-              {trainPlan ? (
-                <div className="report-kv-grid" style={{ marginTop: 12 }}>
-                  <div className="report-kv">
+              <div className="score-details">
+                <div className="score-bar-head">
+                  <span>综合评分</span>
+                  <strong>{scoreInfo.percent}%</strong>
+                </div>
+                <div className="score-bar">
+                  <div
+                    className="score-bar-fill"
+                    style={{ width: `${scoreInfo.percent}%` }}
+                  />
+                </div>
+
+                <div className="report-kv-grid result-kv-grid">
+                  <div className="report-kv mini-kv">
+                    <span>动作名称</span>
+                    <strong>{action}</strong>
+                  </div>
+                  <div className="report-kv mini-kv">
+                    <span>采集帧数</span>
+                    <strong>{framesBuffered}</strong>
+                  </div>
+                  <div className="report-kv mini-kv">
+                    <span>标准关键帧</span>
+                    <strong>{stdKeyframesRef.current.length}</strong>
+                  </div>
+                  <div className="report-kv mini-kv">
+                    <span>用户关键帧</span>
+                    <strong>{userKeyframesRef.current.length}</strong>
+                  </div>
+                  <div className="report-kv mini-kv">
                     <span>下一轮目标</span>
                     <strong>
                       {trainPlan?.current_target != null
@@ -1571,7 +1606,7 @@ function RehabMain({ userName }: { userName: string }) {
                         : "--"}
                     </strong>
                   </div>
-                  <div className="report-kv">
+                  <div className="report-kv mini-kv">
                     <span>下一轮阈值</span>
                     <strong>
                       {trainPlan?.current_threshold != null
@@ -1579,69 +1614,67 @@ function RehabMain({ userName }: { userName: string }) {
                         : "--"}
                     </strong>
                   </div>
-                  <div className="report-kv">
+                  <div className="report-kv mini-kv">
                     <span>下一轮轮次</span>
                     <strong>
-                      {Math.min(trainPlan.current_round || 1, trainPlan.max_rounds || 4)}/
-                      {trainPlan.max_rounds || 4}
+                      {Math.min(trainPlan?.current_round || 1, trainPlan?.max_rounds || 4)}/
+                      {trainPlan?.max_rounds || 4}
                     </strong>
                   </div>
-                  <div className="report-kv">
+                  <div className="report-kv mini-kv">
                     <span>训练进度</span>
-                    <strong>{trainPlan.is_finished ? "已完成4轮" : "继续下一轮"}</strong>
+                    <strong>{trainPlan?.is_finished ? "已完成4轮" : "继续下一轮"}</strong>
                   </div>
                 </div>
-              ) : null}
+              </div>
             </div>
-          </div>
 
-          <div className="feedback-box">
-            <div className="feedback-title">文字反馈</div>
-            <div className="feedback-content">
-              {evalError ? (
-                <div className="error-text">{evalError}</div>
-              ) : feedbackText ? (
-                feedbackText
-              ) : isConfirming ? (
-                "文字反馈生成中..."
+            <div className="feedback-box tighter-feedback-box">
+              <div className="feedback-title">文字反馈</div>
+              <div className="feedback-content tighter-feedback-content">
+                {evalError ? (
+                  <div className="error-text">{evalError}</div>
+                ) : feedbackText ? (
+                  feedbackText
+                ) : isConfirming ? (
+                  "文字反馈生成中..."
+                ) : (
+                  "完成训练后，系统将在这里生成动作反馈与改进建议。"
+                )}
+              </div>
+            </div>
+          </SectionCard>
+
+          <SectionCard
+            className="coach-panel"
+            title="数字人讲解反馈"
+            desc="评分、文字反馈和训练计划更新后继续生成。"
+          >
+            <div className="coach-box tighter-coach-box">
+              {coachVideoUrl ? (
+                <video
+                  ref={coachPlayerRef}
+                  src={coachVideoUrl}
+                  controls
+                  autoPlay
+                  playsInline
+                  className="coach-video"
+                />
+              ) : isGeneratingCoach ? (
+                <div className="empty-video-state">数字人视频生成中...</div>
               ) : (
-                "完成训练后，系统将在这里生成动作反馈与改进建议。"
+                <div className="empty-video-state">暂无数字人反馈视频</div>
               )}
             </div>
-          </div>
-        </SectionCard>
 
-        <SectionCard
-          title="数字人讲解反馈"
-          desc="数字人视频会在评分、文字反馈和训练计划更新后继续生成。"
-        >
-          <div className="coach-box">
-            {coachVideoUrl ? (
-              <video
-                ref={coachPlayerRef}
-                src={coachVideoUrl}
-                controls
-                autoPlay
-                playsInline
-                className="coach-video"
-              />
-            ) : isGeneratingCoach ? (
-              <div className="empty-video-state">数字人视频生成中...</div>
-            ) : (
-              <div className="empty-video-state">暂无数字人反馈视频</div>
-            )}
-          </div>
-
-          <div className="privacy-note">
-            系统会按当前选择的标准视频分别维护训练计划；切换视频后自动从第1轮重新开始。
-          </div>
-        </SectionCard>
+            <div className="privacy-note">
+              系统会按当前选择的标准视频分别维护训练计划；切换视频后自动从第1轮重新开始。
+            </div>
+          </SectionCard>
+        </div>
       </div>
 
-      <SectionCard
-        title="系统调试信息"
-        desc="用于开发阶段查看后端返回的结构化结果。"
-      >
+      <SectionCard title="系统调试信息" desc="用于开发阶段查看后端返回结果。">
         <pre className="debug-box">
           {JSON.stringify(
             {
